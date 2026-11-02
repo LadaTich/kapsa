@@ -1,0 +1,103 @@
+# Kapsa: jak ji zprovoznit
+
+Kapsa je webová aplikace, kterou si nainstaluješ na plochu iPhonu i počítače. Data jsou v databázi Supabase, takže vidíš totéž na obou zařízeních. Hosting i databáze jsou zdarma. Celé nastavení zabere asi 30 minut a děláš ho jednou.
+
+Než začneš, můžeš si aplikaci vyzkoušet bez databáze: otevři `index.html` přes jakýkoli lokální server (třeba `python3 -m http.server` ve složce projektu) a přidej na konec adresy `?demo`. Naplní se vymyšlenými daty, která zůstanou jen v prohlížeči.
+
+## 1. Databáze v Supabase
+
+1. Založ si účet na supabase.com a vytvoř nový projekt. Region zvol Frankfurt (eu-central), heslo k databázi si ulož, ale v aplikaci ho potřebovat nebudeš.
+2. V levém menu otevři **SQL Editor**, dej **New query**, vlož celý obsah souboru `supabase/schema.sql` a spusť tlačítkem **Run**. Skript vytvoří tabulky, zabezpečení a funkci pro zápis plateb z Apple Pay.
+3. Otevři **Authentication → Users → Add user → Create new user**. Zadej svůj e-mail a heslo a zaškrtni automatické potvrzení (Auto Confirm User). Tímhle účtem se budeš do Kapsy přihlašovat.
+4. V **Authentication → Sign In / Providers** vypni **Allow new users to sign up**. Nikdo další si pak účet nezaloží.
+5. V **Project Settings → API Keys** (u starších projektů **Settings → API**) si zkopíruj:
+   - **Project URL** (vypadá jako `https://abcdefgh.supabase.co`),
+   - **Publishable key** (začíná `sb_publishable_`), případně starší **anon public** klíč.
+
+Tyto dvě hodnoty vlož do souboru `js/config.js` místo vzorových.
+
+Oba údaje jsou veřejné z principu: bez přihlášení přes ně nikdo tvoje data nepřečte, to hlídá zabezpečení v databázi. Nikdy ale nikam nedávej **secret** ani **service_role** klíč.
+
+Bezplatný tarif Supabase stačí na desítky let plateb. Projekt se uspí, pokud ho týden nikdo nepoužije; při denním používání se to nestane, a kdyby ano, v administraci ho jedním kliknutím probudíš.
+
+## 2. Zveřejnění na GitHub Pages
+
+1. Založ si účet na github.com a vytvoř nový repozitář, třeba `kapsa`. GitHub Pages zdarma vyžaduje veřejný repozitář; v kódu nic tajného není, přihlášení a data jsou v Supabase.
+2. Na stránce repozitáře zvol **Add file → Upload files** a přetáhni tam celý obsah složky projektu (včetně podsložek `css`, `js`, `icons`, `supabase`). Potvrď **Commit changes**.
+3. V **Settings → Pages** nastav **Source: Deploy from a branch**, větev `main` a složku `/ (root)`. Ulož.
+4. Za minutu až dvě poběží aplikace na adrese `https://tvoje-jmeno.github.io/kapsa/`.
+
+Chceš soukromý repozitář? Stejně zdarma to jde přes Cloudflare Pages (propojíš repozitář a nastavíš výstupní složku na kořen projektu, žádný build příkaz).
+
+## 3. Instalace
+
+**iPhone:** otevři adresu v Safari, ťukni na Sdílet a zvol **Přidat na plochu**. Kapsu pak spouštěj z ikony na ploše a jednou se v ní přihlas. Aplikace z plochy má vlastní úložiště, takže přihlášení ze Safari se nepřenáší.
+
+**Počítač:** otevři adresu v Chrome nebo Edge a v adresním řádku klikni na ikonu instalace. V Safari na Macu zvol Soubor → Přidat do Docku.
+
+## 4. Automatický zápis plateb z Apple Pay
+
+Tohle je část, díky které nemusíš nic opisovat. Po každé platbě telefonem nebo hodinkami iPhone pošle částku a obchodníka do Kapsy. Potřebuješ iOS 17 nebo novější.
+
+Údaje, které budeš vkládat, najdeš v Kapse v **Nastavení → Platby z Apple Pay**. Každý má tlačítko na zkopírování, takže je nejjednodušší dělat Zkratku přímo v iPhonu.
+
+1. Otevři aplikaci **Zkratky**, dole záložku **Automatizace** a ťukni na **+**.
+2. Vyber **Transakce**. Zvol svou kartu Raiffeisenbank, kategorie obchodníků nech všechny. Zaškrtni **Spustit okamžitě** (jinak by se tě iPhone pokaždé ptal) a pokračuj **Další**.
+3. Zvol **Nová prázdná automatizace** a přidej akci **Získat obsah URL**.
+   - Do pole URL vlož **Adresu** z Kapsy.
+   - Rozbal šipku u akce. **Metoda:** POST.
+   - **Hlavičky:** přidej hlavičku s názvem `apikey` a hodnotou **apikey** z Kapsy.
+   - **Tělo požadavku:** JSON. Přidej tři textová pole:
+     - `p_token` s hodnotou **p_token** z Kapsy,
+     - `p_amount` s proměnnou **Částka** (ťukni do hodnoty, vyber Vstup zkratky a vlastnost Částka),
+     - `p_merchant` s proměnnou **Obchodník** (stejně jako u částky).
+4. Volitelně přidej akci **Získat hodnotu slovníku**: hodnota pro klíč `zprava` ve slovníku **Obsah URL**. Za ni přidej **Zobrazit oznámení** s textem **Hodnota slovníku**. Po každé platbě pak uvidíš třeba „Potraviny: zbývá 2 880 Kč z 4 475 Kč. Dnes ještě 412 Kč.“ a při blížícím se limitu varování.
+5. Ulož. Při příští platbě se v Kapse objeví položka v sekci **Ke kontrole** s navrženou kategorií.
+
+Názvy akcí se mohou v různých verzích iOS mírně lišit; v angličtině jde o Transaction, Get Contents of URL, Get Dictionary Value a Show Notification.
+
+Pár věcí, které je dobré vědět:
+
+- Automatizace se spouští při přiložení telefonu, ještě než banka platbu potvrdí. Když platba neprojde, v Kapse ji smažeš tlačítkem „Platba neproběhla? Smazat“.
+- Platby plastovou kartou, převody a inkasa Zkratka nezachytí. Na ty je import výpisu nebo ruční zápis.
+- U plateb v cizí měně Kapsa uloží původní částku s poznámkou a ty doplníš korunovou.
+- Pokud používáš starší anon klíč (začíná `eyJ`) a Zkratka hlásí chybu oprávnění, přidej ještě hlavičku `Authorization` s hodnotou `Bearer ` a za mezerou stejný klíč.
+- Osobní klíč (`p_token`) můžeš v Nastavení kdykoli vygenerovat znovu. Starý tím přestane platit, takže ho přepiš i ve Zkratce.
+
+## 5. Import výpisu z Raiffeisenbank
+
+V internetovém bankovnictví otevři pohyby na účtu, nastav období a stáhni je jako CSV. V Kapse pak **Nastavení → Import výpisu → Vybrat soubor CSV**. Kapsa sama rozpozná sloupce a ukáže náhled; kdyby něco nesedělo, přepneš sloupec v nabídce.
+
+Platby, které už Kapsa zná ze Zkratky nebo z pravidelných plateb, se podle částky a data spárují a nezdvojí. Opakovaný import stejného souboru nic nepřidá. Pohyby, které Kapsa neumí zařadit, skončí v sekci Ke kontrole.
+
+## 6. Jak Kapsa počítá
+
+**Rozdělení výplaty.** Když přijde výplata, zapiš ji (na Přehledu je tlačítko Zapsat výplatu). Kapsa z ní nejdřív odečte pevné výdaje: všechny pravidelné platby v období a vše v kategoriích označených jako pevné (nájem, energie, předplatné). Zbytek rozdělí podle obálek v **Plán → Rozdělení**, výchozí je 20 % krátkodobé úspory, 30 % dlouhodobé investice a 50 % spotřeba. Obálky můžeš přejmenovat, změnit procenta nebo přidat vlastní (třeba Dárky 5 %); součet musí být 100 %.
+
+**Odkládání.** U obálek na úspory Kapsa ukáže, kolik poslat stranou. Peníze převeď v bankovnictví a v Kapse ťukni na Označit jako odložené. Odložené peníze se nepočítají jako útrata. Když převod později přijde v CSV výpisu, spáruje se a nezdvojí.
+
+**Denní limit.** Peníze na spotřebu minus to, co už jsi v období utratil mimo pevné výdaje, rozpočítané na zbývající dny včetně dneška. Dokud v období nezapíšeš výplatu, Kapsa počítá s tou minulou a upozorní tě na to.
+
+**Limity kategorií.** U každé proměnlivé kategorie nastavíš limit buď jako procento ze spotřeby, nebo jako pevnou částku. Procenta se přizpůsobí výši výplaty, což se při kolísavém příjmu hodí víc. V Plán → Limity uvidíš, kolik ze spotřeby je rozdělené a kolik zůstává volné.
+
+**Tipy.** Kapsa průběžně sleduje tvoje data a radí: připomene neodložené peníze, upozorní na kategorii, ve které tímhle tempem přetáhneš limit, navrhne zvýšit limit, který pravidelně nestačí, nebo snížit ten, který nevyčerpáš, najde časté drobné nákupy a opakované platby, které nemáš mezi pravidelnými. U návrhu limitu stačí ťuknout a změní se. Tipy, které nechceš vidět, skryješ do konce období. Čím víc měsíců dat, tím jsou tipy přesnější; ty o dlouhodobých limitech potřebují aspoň dvě celá období.
+
+**Oznámení po platbě** ze Zkratky ukazuje stav kategorie a kolik ti ještě dnes zbývá, třeba „Potraviny: zbývá 2 880 Kč z 4 475 Kč. Dnes ještě 412 Kč.“
+
+**Rozpočtové období** začíná dnem, který nastavíš v Nastavení. Nastav den, kdy ti obvykle chodí výplata.
+
+**Automatické zařazování:** když platbu zařadíš, Kapsa si zapamatuje první slovo obchodníka (u plateb přes SumUp, GoPay a podobné první dvě). Pravidla upravíš v Nastavení.
+
+**Pravidelné platby** se zapíšou samy v den splatnosti, jakmile Kapsu otevřeš.
+
+## 7. Úpravy a aktualizace
+
+Pokud už máš databázi založenou ze starší verze, spusť `supabase/schema.sql` v SQL Editoru znovu. Skript jen doplní, co chybí, a existující data nechá být.
+
+Když změníš soubory a nahraješ je znovu na GitHub, zvyš v `sw.js` číslo verze (`kapsa-v1` na `kapsa-v2`). Aplikace si pak stáhne nové soubory místo uložených.
+
+Zálohu všech dat si stáhneš v Nastavení tlačítkem **Stáhnout zálohu**. Supabase navíc v administraci umí export tabulek do CSV.
+
+## Přímé napojení na banku později
+
+Raiffeisenbank má rozhraní Premium API, které se aktivuje certifikátem z internetového bankovnictví (Nastavení → Správa certifikátů). Pokud ho uvidíš i u svého osobního účtu, dá se Kapsa doplnit o automatické stahování všech pohybů. Vyžaduje to malou serverovou funkci, kterou jde provozovat zdarma, ale je to samostatný krok.
