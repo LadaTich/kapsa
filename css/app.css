@@ -17,6 +17,13 @@
   --bad-bg: #F8DDD8;
   --bar-norm: #8FA69A;
   --fixed: #9AA8A0;
+  --panel: #1E3A30;
+  --panel-ink: #EEF4EF;
+  --panel-ink-2: #A9C2B4;
+  --panel-num: #C6EBD2;
+  --panel-line: rgb(255 255 255 / .12);
+  --panel-warn: #F3BE62;
+  --panel-bad: #FF9E91;
   --logo-bg: #1E3A30;
   --logo-fg: #BFE3CB;
   --font: "Schibsted Grotesk", "Helvetica Neue", Helvetica, Arial, system-ui, sans-serif;
@@ -34,7 +41,7 @@
     --ink: #E2EBE5; --ink-2: #AFC0B6; --ink-3: #7F928A;
     --accent: #9CD9B2; --on-accent: #0E1714;
     --ok: #6CC495; --inc: #7FD3A2; --warn: #E6AA4E; --warn-bg: #3A2C13; --bad: #F08B7F; --bad-bg: #3E1D1A;
-    --bar-norm: #4F665B; --fixed: #56675F; --logo-bg: #9CD9B2; --logo-fg: #0E1714;
+    --bar-norm: #4F665B; --fixed: #56675F; --panel: #173126; --panel-ink: #E6EFE9; --panel-ink-2: #9DB8AA; --panel-num: #A8E3BE; --panel-line: rgb(255 255 255 / .1); --panel-warn: #F3BE62; --panel-bad: #FF9E91; --logo-bg: #9CD9B2; --logo-fg: #0E1714;
     color-scheme: dark;
   }
 }
@@ -43,7 +50,7 @@
   --ink: #E2EBE5; --ink-2: #AFC0B6; --ink-3: #7F928A;
   --accent: #9CD9B2; --on-accent: #0E1714;
   --ok: #6CC495; --inc: #7FD3A2; --warn: #E6AA4E; --warn-bg: #3A2C13; --bad: #F08B7F; --bad-bg: #3E1D1A;
-  --bar-norm: #4F665B; --fixed: #56675F; --logo-bg: #9CD9B2; --logo-fg: #0E1714;
+  --bar-norm: #4F665B; --fixed: #56675F; --panel: #173126; --panel-ink: #E6EFE9; --panel-ink-2: #9DB8AA; --panel-num: #A8E3BE; --panel-line: rgb(255 255 255 / .1); --panel-warn: #F3BE62; --panel-bad: #FF9E91; --logo-bg: #9CD9B2; --logo-fg: #0E1714;
   color-scheme: dark;
 }
 
@@ -426,6 +433,106 @@ code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: .88em;
   .arow .a-kc { grid-column: 2 / 4; grid-row: 2; text-align: left; font-weight: 500; color: var(--ink-3); margin-top: -4px; }
   .arow .a-type, .arow .icon-btn { grid-column: 4; grid-row: 1; }
 }
+
+
+/* ---------- přehled: panel se zůstatky ---------- */
+.hero2 {
+  background: var(--panel); color: var(--panel-ink);
+  border-radius: 22px; padding: 22px 20px 4px; margin-bottom: 8px;
+}
+.hero2 .hero-lead { color: var(--panel-ink-2); font-size: 16px; }
+.hero2 .hero-num { color: var(--panel-num); margin: 4px 0 8px; }
+.hero2 .hero-num.warn { color: var(--panel-warn); }
+.hero2 .hero-num.bad { color: var(--panel-bad); }
+.hero2 .hero-sub { color: var(--panel-ink-2); font-size: 15px; }
+.hero-main { padding-bottom: 18px; }
+.tiles { display: grid; grid-template-columns: 1fr 1fr; border-top: 1px solid var(--panel-line); }
+.tile {
+  display: flex; flex-direction: column; gap: 1px; text-align: left;
+  background: none; border: 0; color: inherit; padding: 14px 0 16px; min-width: 0;
+}
+.tile + .tile { border-left: 1px solid var(--panel-line); padding-left: 16px; }
+.t-label { font-size: 13.5px; color: var(--panel-ink-2); font-weight: 600; }
+.t-num { font-size: clamp(22px, 6.4vw, 30px); font-weight: 750; letter-spacing: -0.03em; font-variant-numeric: tabular-nums; line-height: 1.2; white-space: nowrap; }
+.t-num.bad { color: var(--panel-bad); }
+.t-note { font-size: 12.5px; color: var(--panel-ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+button.tile:hover .t-note { text-decoration: underline; }
+button.tile:focus-visible { outline-color: var(--panel-num); }
+
+/* průběh období */
+.burn-box { position: relative; height: 150px; margin-top: 4px; }
+.burn-svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+.bc-plan { stroke: var(--ink-3); stroke-width: 1.25; stroke-dasharray: 4 4; }
+.bc-limit { stroke: var(--line); stroke-width: 1; }
+.bc-area { fill: color-mix(in srgb, var(--ok) 14%, transparent); }
+.bc-line { fill: none; stroke: var(--ok); stroke-width: 2.5; stroke-linejoin: round; stroke-linecap: round; }
+.bc-proj { stroke: var(--ok); stroke-width: 1.5; stroke-dasharray: 2 4; }
+.bc-proj.over { stroke: var(--warn); }
+.bc-dot { position: absolute; width: 11px; height: 11px; margin: -5.5px 0 0 -5.5px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 3px var(--bg); }
+.burn-axis { display: flex; justify-content: space-between; font-size: 12.5px; color: var(--ink-3); margin-top: 8px; font-variant-numeric: tabular-nums; }
+.burn-axis span:nth-child(2) { visibility: hidden; }
+.burn-legend { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 14px 0 0; }
+.burn-legend div { min-width: 0; }
+.burn-legend dt { font-size: 13px; color: var(--ink-2); display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.burn-legend dd { margin: 2px 0 0; font-weight: 700; font-size: 17px; font-variant-numeric: tabular-nums; }
+.burn-legend i { display: inline-block; width: 14px; flex: none; }
+.lg-line { border-top: 2.5px solid var(--ok); }
+.lg-plan { border-top: 1.5px dashed var(--ink-3); }
+.lg-proj { border-top: 2px dotted var(--ok); }
+.lg-proj.over { border-color: var(--warn); }
+
+/* kam šly peníze */
+.donut-wrap { display: flex; align-items: center; gap: 22px; }
+.donut { position: relative; width: 138px; height: 138px; flex: none; }
+.donut svg { width: 100%; height: 100%; transform: rotate(0deg); }
+.donut-c { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; }
+.donut-c b { font-size: 16px; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; }
+.donut-c span { font-size: 12px; color: var(--ink-3); }
+.donut-legend { list-style: none; margin: 0; padding: 0; flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+.donut-legend li { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+.donut-legend .bname { font-weight: 500; }
+
+/* pevné výdaje a výplata */
+.orow { display: flex; align-items: center; gap: 12px; padding: 9px 0; }
+.orow + .orow { border-top: 1px solid color-mix(in srgb, var(--line) 60%, transparent); }
+.orow.done .row-main > span:first-child { color: var(--ink-2); }
+.orow .btn.small { min-height: 34px; padding: 0 12px; font-size: 14px; }
+.wait { display: flex; align-items: center; justify-content: space-between; gap: 12px; background: var(--sunk); border-radius: var(--r-m); padding: 12px 14px; margin-bottom: 14px; }
+.wait p { font-size: 14.5px; color: var(--ink-2); }
+.wait .btn { flex: none; }
+.prow-wrap { display: flex; align-items: center; gap: 10px; }
+.prow-wrap .prow { flex: 1; min-width: 0; }
+.rec-field[hidden], .date-field[hidden] { display: none; }
+@media (max-width: 420px) {
+  .burn-legend dd { font-size: 15px; }
+  .donut { width: 116px; height: 116px; }
+  .wait { flex-direction: column; align-items: flex-start; }
+}
+@media (min-width: 900px) {
+  .hero2 { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 0 32px; padding: 28px 30px 8px; align-items: end; }
+  .hero2 .hero-main { padding-bottom: 22px; }
+  .tiles { border-top: 0; border-left: 1px solid var(--panel-line); grid-template-columns: 1fr; padding-left: 28px; margin-bottom: 14px; }
+  .tile + .tile { border-left: 0; border-top: 1px solid var(--panel-line); padding-left: 0; }
+}
+
+
+/* ---------- účty ---------- */
+.acclist { list-style: none; margin: 0; padding: 0; }
+.acclist li + li { border-top: 1px solid color-mix(in srgb, var(--line) 60%, transparent); }
+.arow2 { display: flex; align-items: center; gap: 12px; width: 100%; text-align: left; border: 0; background: none; padding: 11px 0; }
+.arow2:hover .row-main > span:first-child { text-decoration: underline; text-decoration-color: var(--line); text-underline-offset: 3px; }
+.acc-mark { width: 4px; height: 30px; border-radius: 2px; background: var(--c); flex: none; }
+.acc-val { display: flex; flex-direction: column; align-items: flex-end; }
+.acc-sub { font-size: 12.5px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.acc-actions { margin-top: 10px; align-items: center; }
+.acc-head { padding: 2px 0 4px; }
+.acc-big { font-size: 34px; font-weight: 800; letter-spacing: -0.035em; font-variant-numeric: tabular-nums; line-height: 1.15; }
+.acc-head .btnrow { margin-top: 12px; }
+.acc-edit summary { cursor: pointer; font-weight: 600; color: var(--ok); padding: 4px 0; }
+.form.inner { margin-top: 12px; }
+.a-acc { grid-column: 2 / -1; display: flex; align-items: center; gap: 8px; font-size: 13.5px; color: var(--ink-2); margin-top: -2px; }
+.a-acc .select { flex: 1; }
+.to-field[hidden], .income-check[hidden], .acc-field[hidden] { display: none; }
 
 /* ---------- velké obrazovky ---------- */
 @media (min-width: 1100px) {

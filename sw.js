@@ -1,5 +1,5 @@
 // Offline cache aplikace. Při změně souborů zvyš číslo verze.
-const VERSION = 'kapsa-v2';
+const VERSION = 'kapsa-v7';
 const SHELL = ['./', 'index.html', 'css/app.css', 'js/config.js', 'js/vendor/supabase-2.117.3.js', 'js/util.js', 'js/store.js', 'js/app.js',
   'manifest.webmanifest', 'icons/icon.svg', 'icons/icon-192.png', 'icons/apple-touch-icon.png'];
 

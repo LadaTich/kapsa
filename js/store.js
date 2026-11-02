@@ -1,17 +1,26 @@
 'use strict';
 
 const Store = (() => {
-  const TABLES = ['categories', 'transactions', 'rules', 'recurring', 'goals'];
+  const TABLES = ['categories', 'transactions', 'rules', 'recurring', 'goals', 'accounts'];
   const LOCAL_KEY = 'kapsa-local-v1';
   const CACHE_KEY = 'kapsa-cache-v1';
-  const data = { categories: [], transactions: [], rules: [], recurring: [], goals: [], settings: null };
+  const data = { categories: [], transactions: [], rules: [], recurring: [], goals: [], accounts: [], settings: null };
   let sb = null;
   let mode = 'local'; // 'local' | 'remote' | 'offline'
   let user = null;
+  let changeHook = null;
 
   const cfg = () => window.KAPSA_CONFIG || {};
   const hasConfig = () => !!(cfg().supabaseUrl && cfg().supabaseKey && !/TVUJ|YOUR/i.test(cfg().supabaseUrl));
 
+  // [název, typ, měna, barva, hlavní]
+  const DEFAULT_ACCOUNTS = [
+    ['Běžný účet', 'checking', 'CZK', '#2F7D5B', true],
+    ['Spořicí účet', 'savings', 'CZK', '#3B6EA8', false],
+    ['Investiční účet', 'investment', 'CZK', '#8E4F9E', false],
+    ['Podnikatelský účet', 'business', 'CZK', '#5C6B7A', false],
+    ['Bitcoin', 'crypto', 'BTC', '#C27C0E', false],
+  ];
   const DEFAULT_ALLOCATION = [
     { id: 'save', name: 'Krátkodobé úspory', pct: 20, type: 'save', color: '#3B6EA8' },
     { id: 'invest', name: 'Dlouhodobé investice', pct: 30, type: 'save', color: '#8E4F9E' },
@@ -82,6 +91,7 @@ const Store = (() => {
     } catch (e) { /* poškozená cache se ignoruje */ }
   }
   function persist() {
+    if (changeHook) changeHook();
     try {
       localStorage.setItem(mode === 'local' ? LOCAL_KEY : CACHE_KEY, JSON.stringify(data));
     } catch (e) { /* plné úložiště nevadí, data jsou v databázi */ }
@@ -104,9 +114,16 @@ const Store = (() => {
     if (mode === 'local') {
       let saved = null;
       try { saved = JSON.parse(localStorage.getItem(LOCAL_KEY) || 'null'); } catch (e) { saved = null; }
-      if (saved && saved.settings) { Object.assign(data, saved); normalize(); return; }
+      if (saved && saved.settings) {
+        Object.assign(data, saved);
+        if (!Array.isArray(data.accounts)) data.accounts = [];
+        normalize();
+        if (!data.accounts.length) { await seedAccounts(); persist(); }
+        return;
+      }
       data.settings = { period_start_day: 1, alert_threshold: 80, capture_token: null, allocation: DEFAULT_ALLOCATION.map(b => ({ ...b })) };
       await seedDefaults();
+      await seedAccounts();
       if (window.KAPSA_DEMO || /[?&]demo\b/.test(location.search)) seedDemo();
       normalize();
       persist();
@@ -124,12 +141,18 @@ const Store = (() => {
       if (!data.categories.length) await seedDefaults();
     }
     normalize();
+    if (!data.accounts.length) await seedAccounts();
     persist();
   }
 
   function normalize() {
+    for (const a of data.accounts) {
+      if (a.anchor != null) a.anchor = Number(a.anchor);
+      if (a.invested != null) a.invested = Number(a.invested);
+    }
     for (const t of ['transactions', 'recurring', 'goals']) {
       for (const r of data[t]) {
+        if (r.amount_to != null) r.amount_to = Number(r.amount_to);
         if (r.amount != null) r.amount = Number(r.amount);
         if (r.target != null) r.target = Number(r.target);
         if (r.saved != null) r.saved = Number(r.saved);
@@ -251,6 +274,26 @@ const Store = (() => {
     else data.rules = rules;
   }
 
+  // Výchozí účty; zůstatek z dřívějšího nastavení se přenese na běžný účet
+  async function seedAccounts() {
+    const s = data.settings || {};
+    const rows = DEFAULT_ACCOUNTS.map(([name, type, currency, color, is_main], i) => ({
+      id: U.uuid(), name, type, currency, color, is_main, sort: i, archived: false, card_name: null, invested: null,
+      anchor: is_main && s.balance_anchor != null ? Number(s.balance_anchor) : null,
+      anchor_at: is_main && s.balance_anchor_at ? s.balance_anchor_at : null,
+    }));
+    if (mode === 'remote') await insertMany('accounts', rows);
+    else data.accounts = rows.map(r => ({ ...r, created_at: new Date().toISOString() }));
+    // obálky z výplaty propojit s účty
+    const byType = t => data.accounts.find(a => a.type === t);
+    const allocation = (s.allocation || DEFAULT_ALLOCATION).map(b => ({
+      ...b,
+      account_id: b.account_id || (b.id === 'save' && byType('savings') ? byType('savings').id : b.id === 'invest' && byType('investment') ? byType('investment').id : null),
+    }));
+    if (mode === 'remote' && s.user_id) await saveSettings({ allocation });
+    else if (data.settings) data.settings.allocation = allocation;
+  }
+
   function seedDemo() {
     const c = Object.fromEntries(data.categories.map(x => [x.name, x]));
     const pct = { 'Potraviny': 38, 'Restaurace a kavárny': 14, 'Doprava': 12, 'Drogerie a zdraví': 6, 'Oblečení': 7, 'Zábava a volný čas': 8, 'Domácnost a nákupy': 7, 'Ostatní': 3 };
@@ -269,7 +312,7 @@ const Store = (() => {
     for (let d = 110; d >= 0; d--) {
       const day = U.addDays(today, -d);
       const r = rnd();
-      const n = d === 0 ? 0 : r < 0.55 ? 0 : r < 0.95 ? 1 : 2;
+      const n = d === 0 ? 0 : r < 0.48 ? 0 : r < 0.9 ? 1 : 2;
       for (let i = 0; i < n; i++) {
         const s = shops[Math.floor(rnd() * shops.length)];
         const t = new Date(day); t.setHours(10 + Math.floor(rnd() * 10), Math.floor(rnd() * 60));
@@ -281,22 +324,31 @@ const Store = (() => {
       }
       if (day.getDate() === 22) { const t = new Date(day); t.setHours(6); push(t, 'Disney Plus', 199, 'Předplatné a telefon'); }
     }
+    // [název, částka, kategorie, den platby, strhává se samo, pattern]
     const recurringDefs = [
-      ['Nájem', 14500, 'Bydlení a energie', 15], ['Elektřina a plyn', 2100, 'Bydlení a energie', 20],
-      ['Netflix', 259, 'Předplatné a telefon', 8], ['Spotify', 189, 'Předplatné a telefon', 15], ['Telefon', 450, 'Předplatné a telefon', 18],
+      ['Nájem', 14500, 'Bydlení a energie', 15, false, 'pronajimatel'],
+      ['Elektřina a plyn', 2100, 'Bydlení a energie', 20, false, 'pre'],
+      ['Telefon', 450, 'Předplatné a telefon', 5, false, 'vodafone'],
+      ['Netflix', 259, 'Předplatné a telefon', 8, true, 'netflix'],
+      ['Spotify', 189, 'Předplatné a telefon', 15, true, 'spotify'],
     ];
     const recurring = [];
-    for (const [name, amount, cat, day] of recurringDefs) {
+    const created = U.addDays(today, -150).toISOString();
+    for (const [name, amount, cat, day, auto, pattern] of recurringDefs) {
       const id = U.uuid();
       for (let back = 4; back >= 0; back--) {
         const d = new Date(today.getFullYear(), today.getMonth() - back, day, 8);
         if (d <= today && U.daysBetween(d, today) <= 110) {
-          tx.push({ id: U.uuid(), occurred_at: d.toISOString(), amount, kind: 'expense', category_id: c[cat].id, merchant: name, note: null, source: 'recurring', status: 'confirmed', external_id: null, recurring_id: id, created_at: d.toISOString() });
+          tx.push({ id: U.uuid(), occurred_at: d.toISOString(), amount, kind: 'expense', category_id: c[cat].id, merchant: name, note: null, source: auto ? 'recurring' : 'manual', status: 'confirmed', external_id: null, recurring_id: id, created_at: d.toISOString() });
         }
       }
-      let next = new Date(today.getFullYear(), today.getMonth(), day);
-      if (next <= today) next = new Date(today.getFullYear(), today.getMonth() + 1, day);
-      recurring.push({ id, name, amount, kind: 'expense', category_id: c[cat].id, every: 'month', next_date: U.isoDate(next), active: true });
+      let next = null;
+      if (auto) {
+        next = new Date(today.getFullYear(), today.getMonth(), day);
+        if (next <= today) next = new Date(today.getFullYear(), today.getMonth() + 1, day);
+        next = U.isoDate(next);
+      }
+      recurring.push({ id, name, amount, kind: 'expense', category_id: c[cat].id, every: 'month', next_date: next, pattern, active: true, created_at: created });
     }
     // proměnlivé výplaty vždy 10. a odložené peníze
     const salaries = [43800, 38900, 46200, 41250];
@@ -316,6 +368,23 @@ const Store = (() => {
     const yEve = U.addDays(today, -1); yEve.setHours(19, 24); push(yEve, 'SUMUP *PEKARNA KABINET', 96, null, { status: 'pending' });
     data.transactions = tx;
     data.recurring = recurring;
+    // zůstatky účtů srovnané s bankou
+    const acc = t => data.accounts.find(a => a.type === t);
+    const setA = (t, v, daysAgo, invested) => { const a = acc(t); a.anchor = v; a.anchor_at = U.addDays(today, -daysAgo).toISOString(); if (invested != null) a.invested = invested; };
+    setA('checking', 36800, 21);
+    setA('savings', 64200, 120);
+    setA('investment', 182500, 40, 160000);
+    setA('business', 48900, 10);
+    setA('crypto', 0.0418, 60, 62000);
+    acc('business').card_name = 'firemni';
+    data.transactions.forEach(t => {
+      if (t.kind === 'transfer') t.to_account_id = t.bucket === 'save' ? acc('savings').id : t.bucket === 'invest' ? acc('investment').id : null;
+    });
+    // nákup bitcoinu z investičního účtu a převod z podnikání jako příjem
+    const d1 = U.addDays(today, -12); d1.setHours(20);
+    data.transactions.push({ id: U.uuid(), occurred_at: d1.toISOString(), amount: 5000, amount_to: 0.0026, kind: 'transfer', account_id: acc('investment').id, to_account_id: acc('crypto').id, merchant: 'Nákup BTC', status: 'confirmed', source: 'manual', created_at: d1.toISOString() });
+    const d2 = U.addDays(today, -6); d2.setHours(11);
+    data.transactions.push({ id: U.uuid(), occurred_at: d2.toISOString(), amount: 2890, kind: 'expense', account_id: acc('business').id, merchant: 'Alza.cz', status: 'confirmed', source: 'applepay', created_at: d2.toISOString() });
     data.goals = [
       { id: U.uuid(), name: 'Dovolená v Chorvatsku', target: 30000, saved: 12400, deadline: U.isoDate(new Date(today.getFullYear() + 1, 5, 30)), color: '#3B6EA8' },
       { id: U.uuid(), name: 'Rezerva na tři měsíce', target: 90000, saved: 41000, deadline: null, color: '#2F7D5B' },
@@ -329,6 +398,8 @@ const Store = (() => {
     captureUrl: () => hasConfig() ? `${cfg().supabaseUrl.replace(/\/$/, '')}/rest/v1/rpc/capture_payment` : '',
     apiKey: () => cfg().supabaseKey || '',
     resetLocal: () => { localStorage.removeItem(LOCAL_KEY); },
+    DEFAULT_ACCOUNTS,
     DEFAULT_ALLOCATION,
+    onChange: fn => { changeHook = fn; },
   };
 })();

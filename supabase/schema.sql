@@ -85,14 +85,44 @@ alter table public.settings add column if not exists allocation jsonb not null d
 alter table public.categories add column if not exists fixed boolean not null default false;
 alter table public.categories add column if not exists budget_pct numeric(5, 2) check (budget_pct is null or (budget_pct >= 0 and budget_pct <= 100));
 alter table public.transactions add column if not exists bucket text;
+-- Pravidelné výdaje bez data: počítá se s nimi dopředu, zapíšou se, až odejdou
+alter table public.recurring alter column next_date drop not null;
+alter table public.recurring add column if not exists pattern text;
+-- Zůstatek účtu: poslední srovnání s bankou, od něj Kapsa přičítá a odečítá pohyby
+alter table public.settings add column if not exists balance_anchor numeric(12, 2);
+alter table public.settings add column if not exists balance_anchor_at timestamptz;
 alter table public.transactions drop constraint if exists transactions_kind_check;
 alter table public.transactions add constraint transactions_kind_check check (kind in ('expense', 'income', 'transfer'));
+
+-- Účty: běžný (rozpočet), spořicí, podnikatelský, investiční, bitcoin
+create table if not exists public.accounts (
+  id         uuid primary key default gen_random_uuid(),
+  user_id    uuid not null default auth.uid() references auth.users on delete cascade,
+  name       text not null,
+  type       text not null default 'checking' check (type in ('checking', 'savings', 'business', 'investment', 'crypto')),
+  currency   text not null default 'CZK' check (currency in ('CZK', 'BTC')),
+  color      text not null default '#2F7D5B',
+  is_main    boolean not null default false,
+  card_name  text,
+  anchor     numeric(18, 8),
+  anchor_at  timestamptz,
+  invested   numeric(12, 2),
+  sort       int not null default 0,
+  archived   boolean not null default false,
+  created_at timestamptz not null default now()
+);
+create unique index if not exists accounts_one_main on public.accounts (user_id) where is_main;
+alter table public.transactions add column if not exists account_id uuid references public.accounts on delete set null;
+alter table public.transactions add column if not exists to_account_id uuid references public.accounts on delete set null;
+alter table public.transactions add column if not exists amount_to numeric(18, 8);
+alter table public.transactions add column if not exists as_income boolean not null default false;
+alter table public.transactions alter column amount type numeric(18, 8);
 
 -- Zabezpečení: každý vidí a mění jen svoje řádky
 do $$
 declare t text;
 begin
-  foreach t in array array['settings', 'categories', 'recurring', 'transactions', 'rules', 'goals'] loop
+  foreach t in array array['settings', 'categories', 'recurring', 'transactions', 'rules', 'goals', 'accounts'] loop
     execute format('alter table public.%I enable row level security', t);
     execute format('drop policy if exists own_rows on public.%I', t);
     execute format('create policy own_rows on public.%I for all to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid())', t);
@@ -102,7 +132,7 @@ end $$;
 -- Přístup přes Data API (přihlášený uživatel, řádky omezuje zabezpečení výše)
 grant usage on schema public to anon, authenticated;
 grant select, insert, update, delete on public.settings, public.categories, public.recurring,
-  public.transactions, public.rules, public.goals to authenticated;
+  public.transactions, public.rules, public.goals, public.accounts to authenticated;
 
 -- Pomocné funkce
 create or replace function public.kapsa_norm(p text)
@@ -114,53 +144,91 @@ create or replace function public.kapsa_kc(p numeric)
 returns text language sql immutable
 as $$ select replace(to_char(round(p), 'FM999,999,990'), ',', ' ') || ' Kč' $$;
 
--- Peníze na spotřebu v období: (příjem − pevné výdaje) × podíl spotřeby.
--- Když v období ještě nepřišel příjem, počítá s příjmem z minulého období.
-create or replace function public.kapsa_pot(p_user uuid, p_start date, p_end date)
-returns numeric
+-- Patří pohyb k běžnému účtu (s rozpočtem)? Pohyby bez účtu jsou z běžného.
+create or replace function public.kapsa_main(p_user uuid, p_account uuid)
+returns boolean language sql stable
+set search_path = public
+as $$ select p_account is null or exists (select 1 from accounts a where a.id = p_account and a.user_id = p_user and a.is_main) $$;
+
+-- Základ jednoho období: peníze na spotřebu bez převodu z minula a utracené proměnlivé výdaje.
+-- Příjem: jen skutečně zapsaný v období (žádný odhad podle minulé výplaty).
+-- Pevné výdaje: zaplacené (pravidelné nebo v pevné kategorii) + pravidelné, které teprve odejdou.
+drop function if exists public.kapsa_pot(uuid, date, date);
+create or replace function public.kapsa_base(p_user uuid, p_start date, p_end date, out pot numeric, out var_spent numeric)
 language plpgsql stable
 set search_path = public, extensions
 as $$
 declare
-  v_income numeric;
-  v_fixed  numeric;
-  v_future numeric := 0;
-  v_pct    numeric;
-  v_n      bigint;
-  r        record;
+  v_income  numeric;
+  v_fixed   numeric;
+  v_planned numeric := 0;
+  v_pct     numeric;
+  v_n       bigint;
+  r         record;
 begin
-  select coalesce(sum(amount), 0) into v_income from transactions
-   where user_id = p_user and kind = 'income'
+  select coalesce(sum(coalesce(amount_to, amount)), 0) into v_income from transactions
+   where user_id = p_user
+     and ((kind = 'income' and kapsa_main(p_user, account_id)) or (kind = 'transfer' and as_income and kapsa_main(p_user, to_account_id) and to_account_id is not null))
      and (occurred_at at time zone 'Europe/Prague')::date >= p_start
      and (occurred_at at time zone 'Europe/Prague')::date < p_end;
-  if v_income = 0 then
-    select coalesce(sum(amount), 0) into v_income from transactions
-     where user_id = p_user and kind = 'income'
-       and (occurred_at at time zone 'Europe/Prague')::date >= (p_start - interval '1 month')::date
-       and (occurred_at at time zone 'Europe/Prague')::date < p_start;
-  end if;
 
   select coalesce(sum(t.amount), 0) into v_fixed
     from transactions t left join categories c on c.id = t.category_id
-   where t.user_id = p_user and t.kind = 'expense'
+   where t.user_id = p_user and t.kind = 'expense' and kapsa_main(p_user, t.account_id)
      and (t.recurring_id is not null or coalesce(c.fixed, false))
      and (t.occurred_at at time zone 'Europe/Prague')::date >= p_start
      and (t.occurred_at at time zone 'Europe/Prague')::date < p_end;
 
   for r in select * from recurring where user_id = p_user and active and kind = 'expense' loop
-    select count(*) into v_n
-      from generate_series(r.next_date::timestamp, (p_end - 1)::timestamp,
-        case r.every when 'week' then interval '7 days' when 'month' then interval '1 month'
-                     when 'quarter' then interval '3 months' else interval '1 year' end) g
-     where g::date >= p_start;
-    v_future := v_future + v_n * r.amount;
+    if r.next_date is null then
+      -- závazek na každé období: dokud není zaplacený, počítá se plánovaná částka
+      if (r.created_at at time zone 'Europe/Prague')::date < p_end and not exists (
+        select 1 from transactions t where t.user_id = p_user and t.recurring_id = r.id
+           and (t.occurred_at at time zone 'Europe/Prague')::date >= p_start
+           and (t.occurred_at at time zone 'Europe/Prague')::date < p_end) then
+        v_planned := v_planned + r.amount;
+      end if;
+    else
+      select count(*) into v_n
+        from generate_series(r.next_date::timestamp, (p_end - 1)::timestamp,
+          case r.every when 'week' then interval '7 days' when 'month' then interval '1 month'
+                       when 'quarter' then interval '3 months' else interval '1 year' end) g
+       where g::date >= p_start;
+      v_planned := v_planned + v_n * r.amount;
+    end if;
   end loop;
 
   select (e ->> 'pct')::numeric into v_pct
     from settings s, jsonb_array_elements(s.allocation) e
    where s.user_id = p_user and e ->> 'type' = 'spend' limit 1;
 
-  return greatest(0, v_income - v_fixed - v_future) * coalesce(v_pct, 100) / 100;
+  pot := greatest(0, v_income - v_fixed - v_planned) * coalesce(v_pct, 100) / 100;
+
+  select coalesce(sum(t.amount), 0) into var_spent
+    from transactions t left join categories c on c.id = t.category_id
+   where t.user_id = p_user and t.kind = 'expense' and kapsa_main(p_user, t.account_id)
+     and t.recurring_id is null and not coalesce(c.fixed, false)
+     and (t.occurred_at at time zone 'Europe/Prague')::date >= p_start
+     and (t.occurred_at at time zone 'Europe/Prague')::date < p_end;
+end $$;
+
+-- Peníze na spotřebu včetně nevyčerpaného zbytku z předchozích období (max. 12 zpět)
+create or replace function public.kapsa_spend_pot(p_user uuid, p_start date, p_end date)
+returns numeric
+language plpgsql stable
+set search_path = public, extensions
+as $$
+declare
+  c numeric := 0;
+  b record;
+  i int;
+begin
+  for i in reverse 12..1 loop
+    select * into b from kapsa_base(p_user, (p_start - make_interval(months => i))::date, (p_start - make_interval(months => i - 1))::date);
+    c := greatest(0, b.pot + c - b.var_spent);
+  end loop;
+  select * into b from kapsa_base(p_user, p_start, p_end);
+  return b.pot + c;
 end $$;
 
 -- Zápis platby ze Zkratek na iPhonu (automatizace „Transakce“ z Apple Pay).
@@ -202,6 +270,11 @@ declare
   v_pct       numeric;
   v_line1     text;
   v_line2     text := '';
+  v_rec       uuid;
+  v_rec_name  text;
+  v_rec_cat   uuid;
+  v_acc       uuid;
+  v_acc_name  text;
 begin
   select s.user_id, s.period_start_day, s.alert_threshold
     into v_user, v_start_day, v_threshold
@@ -240,14 +313,6 @@ begin
    order by length(r.pattern) desc
    limit 1;
 
-  insert into transactions (user_id, occurred_at, amount, kind, category_id, merchant, note, source, status)
-  values (v_user, now(), v_amount, 'expense', v_cat, v_merchant, v_note, 'applepay', 'pending');
-
-  v_who := coalesce(v_merchant, 'platba');
-  if v_note is not null then
-    return json_build_object('zprava', 'Zapsáno: ' || v_who || ', ' || v_raw || '. Částku v korunách doplň v Kapse.');
-  end if;
-
   -- rozpočtové období
   if extract(day from v_today) >= v_start_day then
     v_pstart := make_date(extract(year from v_today)::int, extract(month from v_today)::int, v_start_day);
@@ -255,8 +320,42 @@ begin
     v_pstart := (date_trunc('month', v_today) - interval '1 month')::date + (v_start_day - 1);
   end if;
   v_pend := (v_pstart + interval '1 month')::date;
+
+  -- platba kartou jiného než běžného účtu (podle názvu karty v Peněžence)
+  if nullif(trim(coalesce(p_card, '')), '') is not null then
+    select a.id, a.name into v_acc, v_acc_name from accounts a
+     where a.user_id = v_user and not a.is_main and not a.archived
+       and nullif(trim(coalesce(a.card_name, '')), '') is not null
+       and kapsa_norm(p_card) like '%' || kapsa_norm(a.card_name) || '%'
+     limit 1;
+  end if;
+  if v_acc is not null then
+    insert into transactions (user_id, occurred_at, amount, kind, category_id, merchant, note, source, status, account_id)
+    values (v_user, now(), v_amount, 'expense', null, v_merchant, v_note, 'applepay', 'pending', v_acc);
+    return json_build_object('zprava', 'Zapsáno na účet ' || v_acc_name || ': ' || coalesce(v_merchant, 'platba') || ', ' || kapsa_kc(v_amount) || '.');
+  end if;
+
+  -- je to pravidelná platba, která v tomto období ještě neodešla?
+  select r.id, r.name, r.category_id into v_rec, v_rec_name, v_rec_cat
+    from recurring r
+   where r.user_id = v_user and r.active and r.kind = 'expense' and r.next_date is null
+     and (' ' || kapsa_norm(v_merchant) || ' ') like ('% ' || coalesce(nullif(kapsa_norm(r.pattern), ''), split_part(kapsa_norm(r.name), ' ', 1)) || '%')
+     and not exists (select 1 from transactions t where t.recurring_id = r.id
+           and (t.occurred_at at time zone 'Europe/Prague')::date >= v_pstart
+           and (t.occurred_at at time zone 'Europe/Prague')::date < v_pend)
+   limit 1;
+
+  insert into transactions (user_id, occurred_at, amount, kind, category_id, merchant, note, source, status, recurring_id)
+  values (v_user, now(), v_amount, 'expense', coalesce(v_rec_cat, v_cat), v_merchant, v_note, 'applepay',
+          case when v_rec is null then 'pending' else 'confirmed' end, v_rec);
+
+  v_who := coalesce(v_merchant, 'platba');
+  if v_note is not null then
+    return json_build_object('zprava', 'Zapsáno: ' || v_who || ', ' || v_raw || '. Částku v korunách doplň v Kapse.');
+  end if;
+
   v_days := greatest(1, v_pend - v_today);
-  v_pot := kapsa_pot(v_user, v_pstart, v_pend);
+  v_pot := kapsa_spend_pot(v_user, v_pstart, v_pend);
 
   -- proměnlivé výdaje (bez pevných a pravidelných)
   select coalesce(sum(t.amount), 0),
@@ -272,6 +371,10 @@ begin
     v_left := (v_pot - v_var + v_var_today) / v_days - v_var_today;
     v_line2 := case when v_left >= 0 then ' Dnes ještě ' || kapsa_kc(v_left) || '.'
                     else ' Dnes nad plánem o ' || kapsa_kc(-v_left) || '.' end;
+  end if;
+
+  if v_rec is not null then
+    return json_build_object('zprava', v_rec_name || ': zapsáno jako zaplacené, ' || kapsa_kc(v_amount) || '.' || v_line2);
   end if;
 
   if v_cat is null then
@@ -310,4 +413,5 @@ end $$;
 
 revoke all on function public.capture_payment(text, text, text, text) from public;
 grant execute on function public.capture_payment(text, text, text, text) to anon, authenticated;
-revoke all on function public.kapsa_pot(uuid, date, date) from public, anon, authenticated;
+revoke all on function public.kapsa_base(uuid, date, date) from public, anon, authenticated;
+revoke all on function public.kapsa_spend_pot(uuid, date, date) from public, anon, authenticated;

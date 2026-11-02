@@ -7,7 +7,7 @@
 
   const ui = {
     view: 'prehled', planTab: 'rozdeleni',
-    txKind: 'all', txSearch: '', txCat: '', txOffset: 0,
+    txKind: 'all', txSearch: '', txCat: '', txAcc: '', txOffset: 0,
     repMode: 'tyden', repOffset: 0, inboxAll: false, allocDraft: null,
   };
 
@@ -24,6 +24,7 @@
     left: '<path d="m14.5 6-6 6 6 6"/>',
     right: '<path d="m9.5 6 6 6-6 6"/>',
     search: '<circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/>',
+    wallet: '<rect x="3.5" y="6" width="17" height="13" rx="2.5"/><path d="M3.5 10.5h17M15.5 15h2"/>',
     copy: '<rect x="8.5" y="8.5" width="11" height="11" rx="2"/><path d="M5 15.5V6a1 1 0 0 1 1-1h9.5"/>',
   };
   const icon = (n, cls = '') => `<svg class="ic ${cls}" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${ICON[n]}</svg>`;
@@ -46,7 +47,64 @@
   const when = t => new Date(t.occurred_at);
   const byDateDesc = (a, b) => when(b) - when(a);
   const inRange = (t, a, b) => { const d = when(t); return d >= a && d < b; };
-  const txIn = (a, b, kind) => D.transactions.filter(t => (!kind || t.kind === kind) && inRange(t, a, b));
+  // ---------- účty ----------
+  const accounts = () => (D.accounts || []).filter(a => !a.archived).sort((a, b) => (b.is_main - a.is_main) || (a.sort - b.sort));
+  const mainAcc = () => (D.accounts || []).find(a => a.is_main) || null;
+  const accById = id => (id ? (D.accounts || []).find(a => a.id === id) : mainAcc());
+  const isMainId = id => !id || (mainAcc() && id === mainAcc().id);
+  const ACC_TYPES = { checking: 'Běžný', savings: 'Spořicí', business: 'Podnikatelský', investment: 'Investiční', crypto: 'Kryptoměna' };
+  const bucketAccount = b => (b && b.account_id ? accById(b.account_id) : null);
+  const transferTo = t => (t.to_account_id ? accById(t.to_account_id) : bucketAccount(bucketById(t.bucket)));
+  const fmtBtc = v => `${new Intl.NumberFormat('cs-CZ', { minimumFractionDigits: 4, maximumFractionDigits: 8 }).format(Number(v) || 0)}\u00a0BTC`;
+  const fmtAcc = (a, v) => (a && a.currency === 'BTC' ? fmtBtc(v) : U.money(v));
+  const BTC_KEY = 'kapsa-btc-price';
+  const btcPrice = () => { try { return JSON.parse(localStorage.getItem(BTC_KEY) || 'null'); } catch (e) { return null; } };
+  const setBtcPrice = (price, source) => { try { localStorage.setItem(BTC_KEY, JSON.stringify({ price, source, at: new Date().toISOString() })); } catch (e) { /* nevadí */ } };
+
+  // Zůstatek účtu: poslední srovnání plus pohyby od té doby (v měně účtu)
+  function accBalance(a) {
+    if (!a || a.anchor == null || !a.anchor_at) return null;
+    const at = new Date(a.anchor_at);
+    let b = Number(a.anchor);
+    for (const t of D.transactions) {
+      if (when(t) <= at) continue;
+      const fromHere = a.is_main ? isMainId(t.account_id) : t.account_id === a.id;
+      if (t.kind === 'transfer') {
+        if (fromHere) b -= Number(t.amount);
+        const to = transferTo(t);
+        if (to && to.id === a.id) b += Number(t.amount_to != null ? t.amount_to : t.amount);
+      } else if (fromHere) b += (t.kind === 'income' ? 1 : -1) * Number(t.amount);
+    }
+    return b;
+  }
+  // Kolik se do investice celkem vložilo: zadaná částka + převody dovnitř − převody ven od posledního srovnání
+  function accInvested(a) {
+    if (!a || !a.invested) return null;
+    const at = a.anchor_at ? new Date(a.anchor_at) : new Date(0);
+    let v = Number(a.invested);
+    for (const t of D.transactions) {
+      if (t.kind !== 'transfer' || when(t) <= at) continue;
+      const to = transferTo(t);
+      const from = accById(t.account_id);
+      if (to && to.id === a.id) v += from && from.currency === 'BTC' ? 0 : Number(t.amount);
+      if (t.account_id === a.id) v -= a.currency === 'BTC' ? Number(t.amount_to || 0) : Number(t.amount);
+    }
+    return Math.max(0, v);
+  }
+  const accCzk = a => {
+    const b = accBalance(a);
+    if (b == null) return null;
+    if (a.currency !== 'BTC') return b;
+    const p = btcPrice();
+    return p ? b * p.price : null;
+  };
+
+  const inMain = t => (t.kind === 'transfer' ? isMainId(t.account_id) : isMainId(t.account_id));
+  const txIn = (a, b, kind) => D.transactions.filter(t => (!kind || t.kind === kind) && inMain(t) && inRange(t, a, b));
+  const txAny = (a, b) => D.transactions.filter(t => inRange(t, a, b));
+  // Převod z jiného účtu na běžný, označený jako příjem do rozpočtu
+  const incomeTransfersIn = (a, b) => D.transactions.filter(t => t.kind === 'transfer' && t.as_income && t.to_account_id && isMainId(t.to_account_id) && !isMainId(t.account_id) && inRange(t, a, b));
+  const incomeIn = (a, b) => sum(txIn(a, b, 'income')) + incomeTransfersIn(a, b).reduce((s, t) => s + Number(t.amount_to != null ? t.amount_to : t.amount), 0);
   const sum = arr => arr.reduce((s, t) => s + Number(t.amount || 0), 0);
   const curPeriod = () => U.period(new Date(), startDay());
   const shiftPeriod = n => { const c = curPeriod(); return U.period(new Date(c.start.getFullYear(), c.start.getMonth() + n, startDay()), startDay()); };
@@ -86,21 +144,37 @@
     return cats(kind).slice().sort((a, b) => (counts[b.id] || 0) - (counts[a.id] || 0) || a.sort - b.sort).slice(0, n);
   }
 
-  // Celý výpočet jednoho rozpočtového období: příjem, pevné výdaje, rozdělení zbytku
-  function periodStats(per) {
-    const incomeActual = sum(txIn(per.start, per.end, 'income'));
-    let income = incomeActual, estimated = false;
-    if (!incomeActual) {
-      const prev = U.period(U.addDays(per.start, -1), startDay());
-      const pi = sum(txIn(prev.start, prev.end, 'income'));
-      if (pi) { income = pi; estimated = true; }
-    }
+  const statsCache = new Map();
+  Store.onChange(() => statsCache.clear());
+  const shiftFrom = (per, n) => U.period(new Date(per.start.getFullYear(), per.start.getMonth() + n, startDay()), startDay());
+  const recPattern = r => (r.pattern ? U.norm(r.pattern) : U.patternFor(r.name));
+
+  // Pravidelné výdaje v období. Bez data = závazek na každé období: dokud neodejde, počítá se dopředu.
+  function obligations(per) {
+    return D.recurring.filter(r => r.active && r.kind === 'expense' && (!r.created_at || new Date(r.created_at) < per.end)).map(r => {
+      const paidTx = D.transactions.filter(t => t.recurring_id === r.id && inRange(t, per.start, per.end)).sort(byDateDesc);
+      const paid = sum(paidTx);
+      if (!r.next_date) {
+        return { r, paidTx, paid, open: paidTx.length ? 0 : Number(r.amount), planned: paidTx.length ? paid : Number(r.amount), done: paidTx.length > 0, auto: false };
+      }
+      const occ = occurrences(r, per.start, per.end);
+      const open = occ.length * Number(r.amount);
+      return { r, paidTx, paid, open, planned: paid + open, done: !occ.length && paidTx.length > 0, auto: true, due: occ[0] || null };
+    }).filter(o => o.planned > 0 || o.done);
+  }
+
+  // Základ období bez převodu z minula (výsledek se ukládá, dokud se data nezmění)
+  function baseStats(per) {
+    const key = U.isoDate(per.start);
+    if (statsCache.has(key)) return statsCache.get(key);
+    const incomeActual = incomeIn(per.start, per.end);
+    // S výplatou se počítá až ve chvíli, kdy ji zapíšeš. Do té doby jen se zbytkem z minula.
+    const income = incomeActual, estimated = false;
     const exp = txIn(per.start, per.end, 'expense');
-    const fixedTx = exp.filter(isFixedTx);
-    const future = D.recurring.filter(r => r.active && r.kind === 'expense')
-      .reduce((s, r) => s + occurrences(r, per.start, per.end).length * Number(r.amount), 0);
-    const fixedPaid = sum(fixedTx);
-    const fixed = fixedPaid + future;
+    const fixedPaid = sum(exp.filter(isFixedTx));
+    const obl = obligations(per);
+    const fixedOpen = obl.reduce((s, o) => s + o.open, 0);
+    const fixed = fixedPaid + fixedOpen;
     const remainder = Math.max(0, income - fixed);
     const transfers = txIn(per.start, per.end, 'transfer');
     const buckets = alloc().map(b => ({
@@ -109,9 +183,27 @@
       done: sum(transfers.filter(t => t.bucket === b.id)),
     }));
     const spendB = buckets.find(b => b.type === 'spend');
-    const pot = spendB ? spendB.amount : remainder;
+    const basePot = spendB ? spendB.amount : remainder;
     const variable = exp.filter(t => !isFixedTx(t));
-    return { per, income, incomeActual, estimated, fixed, fixedPaid, future, remainder, buckets, pot, variable, variableSpent: sum(variable), transfers };
+    const res = { per, income, incomeActual, estimated, fixed, fixedPaid, fixedOpen, obl, remainder, buckets, basePot, variable, variableSpent: sum(variable), transfers };
+    statsCache.set(key, res);
+    return res;
+  }
+
+  // Nevyčerpaná spotřeba se převádí do dalšího období (počítá se nejvýš 12 období zpět)
+  function carryInto(per) {
+    let c = 0;
+    for (let i = 12; i >= 1; i--) {
+      const b = baseStats(shiftFrom(per, -i));
+      c = Math.max(0, b.basePot + c - b.variableSpent);
+    }
+    return c;
+  }
+
+  function periodStats(per) {
+    const b = baseStats(per);
+    const carry = carryInto(per);
+    return { ...b, carry, pot: b.basePot + carry };
   }
 
   function limitOf(c, st) {
@@ -128,7 +220,7 @@
   const stClass = pct => pct >= 100 ? 'bad' : pct >= settings().alert_threshold ? 'warn' : 'ok';
 
   function allowance(st) {
-    if (!st.income) return null;
+    if (!st.income && !st.carry) return null;
     const today = U.startOfDay(new Date());
     const tomorrow = U.addDays(today, 1);
     const spentToday = sum(st.variable.filter(t => inRange(t, today, tomorrow)));
@@ -136,6 +228,21 @@
     const remaining = st.pot - st.variableSpent;
     const perDay = (remaining + spentToday) / daysLeft;
     return { daysLeft, remaining, perDay, spentToday, leftToday: perDay - spentToday };
+  }
+
+  const balance = () => accBalance(mainAcc());
+
+  // Patří platba k pravidelnému výdaji, který v období ještě neodešel?
+  function matchObligation(text, amount, date, skip = new Set()) {
+    const per = U.period(date, startDay());
+    const open = obligations(per).filter(o => !o.done && !o.auto && !skip.has(`${o.r.id}@${U.isoDate(per.start)}`));
+    const n = ` ${U.norm(text)} `;
+    let m = open.find(o => { const p = recPattern(o.r); return p && p.length > 1 && n.includes(` ${p}`); });
+    if (!m && amount) {
+      const c = open.filter(o => Math.abs(o.planned - amount) <= o.planned * 0.01);
+      if (c.length === 1) m = c[0];
+    }
+    return m ? m.r : null;
   }
 
   // ---------- tipy ----------
@@ -160,8 +267,26 @@
           text: `Z výplaty ještě čeká ${U.money(left)} na ${b.name.toLowerCase()}. Pošli je stranou hned, dokud jsou na účtu.`,
           action: { label: 'Označit jako odložené', act: 'transfer', b: b.id } });
       });
-    } else if (st.estimated && elapsed >= 3) {
-      tips.push({ id: 'income-missing', p: 90, tone: 'act', text: 'Výplata za toto období ještě není zapsaná. Počítám s tou minulou, takže limity nemusí sedět.', action: { label: 'Zapsat výplatu', act: 'add-income' } });
+    }
+
+    // nezapsané pravidelné výdaje ke konci období
+    if (frac >= 0.75) {
+      st.obl.filter(o => !o.done && !o.auto).forEach(o => tips.push({ id: `unpaid-${o.r.id}`, p: 75, tone: 'act',
+        text: `${o.r.name} (${U.money(o.planned)}) v tomto období ještě není zapsaný jako zaplacený. Pokud už odešel, označ ho, ať sedí zůstatek.`,
+        action: { label: 'Zaplaceno', act: 'pay-rec', id: o.r.id } }));
+    }
+
+    // zůstatek účtu
+    const s0 = settings();
+    if (s0.balance_anchor == null) {
+      tips.push({ id: 'balance-missing', p: 45, text: 'Opiš do Kapsy aktuální zůstatek z bankovnictví. Od té chvíle ho budu sám přepočítávat podle zapsaných pohybů.', action: { label: 'Zadat zůstatek', act: 'balance' } });
+    } else if (U.daysBetween(new Date(s0.balance_anchor_at), today) > 35) {
+      tips.push({ id: 'balance-old', p: 25, text: `Zůstatek se naposledy srovnával před ${U.daysBetween(new Date(s0.balance_anchor_at), today)} dny. Porovnej ho s bankou, ať víš, jestli nechybí nějaká platba.`, action: { label: 'Srovnat zůstatek', act: 'balance' } });
+    }
+
+    // převedený zbytek
+    if (st.carry > 0 && elapsed <= 5) {
+      tips.push({ id: 'carry', p: 22, tone: 'good', text: `Z minulého období zbylo ${U.money(st.carry)} a přičetlo se ke spotřebě.` });
     }
 
     // 2. hromada nezařazených plateb
@@ -215,6 +340,16 @@
             action: { label: `Snížit na ${s.label}`, act: 'tip-limit', id: c.id, v: s.v, mode: s.mode } });
         }
       });
+    }
+
+    // rezerva na spořicím účtu
+    const sav = accounts().filter(a => a.type === 'savings').reduce((x, a) => x + (accCzk(a) || 0), 0);
+    if (hist.length >= 2 && sav > 0) {
+      const avgExp = hist.reduce((x, h) => x + h.fixedPaid + h.variableSpent, 0) / hist.length;
+      const months = avgExp ? sav / avgExp : 0;
+      if (months && months < 3) {
+        tips.push({ id: 'reserve', p: 32, text: `Na spořicím účtu máš ${U.money(sav)}, to pokryje zhruba ${months.toFixed(1).replace('.', ',')} měsíce výdajů. Rezerva na 3 až 6 měsíců dává klid, kdyby přišel výpadek příjmu.` });
+      }
     }
 
     // 7. časté drobné nákupy za posledních 30 dní
@@ -337,16 +472,31 @@
 
   const amt = (t, exact = true) => t.kind === 'transfer' ? U.money(t.amount, exact) : `${t.kind === 'income' ? '+' : '−'}${U.money(t.amount, exact)}`;
 
-  function txRow(t, withDate = false) {
-    const b = t.kind === 'transfer' ? bucketById(t.bucket) : null;
-    const label = t.kind === 'transfer' ? `Odloženo${b ? `: ${b.name}` : ''}` : t.category_id ? catName(t.category_id) : 'Bez kategorie';
+  function txRow(t, withDate = false, ctxAcc = null) {
+    const multi = accounts().length > 1;
+    let label, color, amountHtml, cls = '';
+    if (t.kind === 'transfer') {
+      const from = accById(t.account_id), to = transferTo(t);
+      label = `${from ? from.name : 'Účet'} → ${to ? to.name : 'stranou'}`;
+      color = to ? to.color : 'var(--ink-3)';
+      const incoming = ctxAcc && to && to.id === ctxAcc.id;
+      const v = incoming && t.amount_to != null ? t.amount_to : t.amount;
+      const curAcc = incoming ? to : from;
+      amountHtml = ctxAcc ? `${incoming ? '+' : '−'}${fmtAcc(curAcc, v)}` : fmtAcc(from, t.amount);
+      cls = ctxAcc ? (incoming ? 'inc' : '') : 'tr';
+    } else {
+      const acc = accById(t.account_id);
+      label = (t.category_id ? catName(t.category_id) : 'Bez kategorie') + (multi && acc && !acc.is_main ? `, ${acc.name}` : '');
+      color = catColor(t.category_id);
+      amountHtml = `${t.kind === 'income' ? '+' : '−'}${fmtAcc(acc, t.amount)}`;
+      cls = t.kind === 'income' ? 'inc' : '';
+    }
     const meta = [label, withDate ? `${U.short(t.occurred_at)} ${U.time(t.occurred_at)}` : U.time(t.occurred_at)];
-    const color = t.kind === 'transfer' ? (b ? b.color : 'var(--ink-3)') : catColor(t.category_id);
     return `<li><button class="tx" data-action="edit-tx" data-id="${t.id}">
       <span class="dot${t.kind === 'transfer' ? ' ring' : ''}" style="--c:${color}"></span>
       <span class="tx-main"><span class="tx-title">${U.esc(t.merchant || label)}</span>
       <span class="tx-meta">${U.esc(meta.join(', '))}${t.status === 'pending' ? '<span class="tag">ke kontrole</span>' : ''}</span></span>
-      <span class="tx-amt ${t.kind === 'income' ? 'inc' : t.kind === 'transfer' ? 'tr' : ''}">${amt(t)}</span></button></li>`;
+      <span class="tx-amt ${cls}">${amountHtml}</span></button></li>`;
   }
 
   function barChart(values, { avg = 0, todayIndex = -1, height = 120, cls = '' } = {}) {
@@ -367,26 +517,26 @@
   }
 
   // ---------- navigace ----------
-  const NAV = [['prehled', 'Přehled', 'home'], ['pohyby', 'Pohyby', 'list'], ['add', 'Přidat', 'plus'], ['reporty', 'Reporty', 'chart'], ['plan', 'Plán', 'plan'], ['nastaveni', 'Nastavení', 'gear']];
+  const NAV = [['prehled', 'Přehled', 'home'], ['ucty', 'Účty', 'wallet'], ['pohyby', 'Pohyby', 'list'], ['add', 'Přidat', 'plus'], ['reporty', 'Reporty', 'chart'], ['plan', 'Plán', 'plan'], ['nastaveni', 'Nastavení', 'gear']];
   function renderNav() {
     const pending = D.transactions.filter(t => t.status === 'pending').length;
     nav.innerHTML = `<div class="brand">${LOGO}<span>Kapsa</span></div>` + NAV.map(([id, label, ic]) => id === 'add'
       ? `<button class="nav-add" data-action="add-tx" aria-label="Přidat pohyb">${icon('plus')}<span>Přidat</span></button>`
-      : `<a href="#${id}" class="nav-item${ui.view === id ? ' on' : ''}${id === 'nastaveni' ? ' desk-only' : ''}"${ui.view === id ? ' aria-current="page"' : ''}>${icon(ic)}<span>${label}</span>${id === 'prehled' && pending ? `<b class="badge" aria-label="${pending} ke kontrole">${pending}</b>` : ''}</a>`).join('');
+      : `<a href="#${id}" class="nav-item${ui.view === id ? ' on' : ''}${id === 'nastaveni' || id === 'ucty' ? ' desk-only' : ''}"${ui.view === id ? ' aria-current="page"' : ''}>${icon(ic)}<span>${label}</span>${id === 'prehled' && pending ? `<b class="badge" aria-label="${pending} ke kontrole">${pending}</b>` : ''}</a>`).join('');
   }
 
   function render() {
     renderNav();
     const v = ui.view;
     main.dataset.view = v;
-    main.innerHTML = v === 'pohyby' ? viewTx() : v === 'reporty' ? viewReports() : v === 'plan' ? viewPlan() : v === 'nastaveni' ? viewSettings() : viewOverview();
+    main.innerHTML = v === 'ucty' ? viewAccounts() : v === 'pohyby' ? viewTx() : v === 'reporty' ? viewReports() : v === 'plan' ? viewPlan() : v === 'nastaveni' ? viewSettings() : viewOverview();
     if (v === 'pohyby') bindTxSearch();
     if (v === 'plan' && ui.planTab === 'rozdeleni') bindAllocForm();
   }
 
   function route() {
     const h = location.hash.replace('#', '');
-    ui.view = ['prehled', 'pohyby', 'reporty', 'plan', 'nastaveni'].includes(h) ? h : 'prehled';
+    ui.view = ['prehled', 'ucty', 'pohyby', 'reporty', 'plan', 'nastaveni'].includes(h) ? h : 'prehled';
     render();
     window.scrollTo(0, 0);
   }
@@ -394,79 +544,204 @@
   // ---------- Přehled ----------
   function viewOverview() {
     const st = periodStats(curPeriod());
-    const per = st.per;
     const a = allowance(st);
-    const today = U.startOfDay(new Date());
-    const todayIdx = U.daysBetween(per.start, today);
-    const daily = Array.from({ length: per.days }, (_, i) => sum(st.variable.filter(t => inRange(t, U.addDays(per.start, i), U.addDays(per.start, i + 1)))));
+    const bal = balance();
+    const s = settings();
     const days = n => `${n} ${U.plural(n, 'den', 'dny', 'dní')}`;
-    const zbyva = n => U.plural(n, 'zbývá', 'zbývají', 'zbývá');
 
-    let hero;
+    let lead, num = '', sub = '', tone = '';
     if (!a) {
-      hero = `<p class="hero-lead">Zapiš výplatu a spočítám, kolik můžeš každý den utratit.</p>
-        <button class="btn primary" data-action="add-income">Zapsat výplatu</button>`;
+      lead = D.transactions.some(t => t.kind === 'income') ? 'Výplata za toto období ještě nepřišla. Až ji zapíšeš, spočítám, kolik můžeš každý den utratit.' : 'Jakmile zapíšeš první výplatu, spočítám, kolik můžeš každý den utratit.';
+    } else if (a.remaining < 0 && !st.incomeActual) {
+      lead = 'Zbytek z minula je vyčerpaný o'; num = U.money(-a.remaining); tone = 'warn';
+      sub = 'Výplata za toto období ještě nepřišla. Až ji zapíšeš, všechno přepočítám.';
     } else if (a.remaining < 0) {
-      hero = `<p class="hero-lead">Peníze na spotřebu jsou přečerpané o</p>
-        <p class="hero-num bad">${U.money(-a.remaining)}</p>
-        <p class="hero-sub">Do konce období ${zbyva(a.daysLeft)} ${days(a.daysLeft)}. Další výdaje už jdou z peněz určených na úspory.</p>`;
+      lead = 'Spotřeba je přečerpaná o'; num = U.money(-a.remaining); tone = 'bad';
+      sub = 'Další výdaje už jdou z peněz určených na úspory.';
     } else if (a.leftToday < 0) {
-      hero = `<p class="hero-lead">Dnes jsi nad denním plánem o</p>
-        <p class="hero-num warn">${U.money(-a.leftToday)}</p>
-        <p class="hero-sub">${a.daysLeft > 1 ? `Na další dny vychází ${U.money(a.remaining / (a.daysLeft - 1))} denně.` : 'Zítra začíná nové období.'}</p>`;
+      lead = 'Dnes jsi nad plánem o'; num = U.money(-a.leftToday); tone = 'warn';
+      sub = a.daysLeft > 1 ? `Na další dny vychází ${U.money(a.remaining / (a.daysLeft - 1))} denně.` : 'Zítra začíná nové období.';
     } else {
-      hero = `<p class="hero-lead">Dnes ještě můžeš utratit</p>
-        <p class="hero-num">${U.money(a.leftToday)}</p>
-        <p class="hero-sub">Na spotřebu ${zbyva(a.daysLeft)} ${U.money(a.remaining)} na ${days(a.daysLeft)}.${st.estimated ? ' Počítám s minulou výplatou, dokud nezapíšeš novou.' : ''}</p>`;
+      lead = 'Dnes ještě můžeš utratit'; num = U.money(a.leftToday);
+      sub = `Na den vychází ${U.money(a.perDay)}.${!st.incomeActual ? ' Výplata ještě nepřišla, počítám jen se zbytkem z minula.' : ''}`;
     }
-    const ribbon = a ? `<div class="ribbon">${barChart(daily, { avg: st.pot / per.days, todayIndex: todayIdx, height: 56, cls: 'mini' })}
-      <div class="ribbon-axis"><span>${U.short(per.start)}</span><span>${U.short(U.addDays(per.end, -1))}</span></div></div>` : '';
+
+    const balTile = `<button class="tile" data-action="balance"><span class="t-label">${U.esc(mainAcc() ? mainAcc().name : 'Na účtu')}</span>
+      <span class="t-num">${bal == null ? 'Zadat' : U.money(bal)}</span>
+      <span class="t-note">${bal == null ? 'opiš zůstatek z banky' : `srovnáno ${U.short(mainAcc().anchor_at)}, upravit`}</span></button>`;
+    const potTile = `<div class="tile"><span class="t-label">Na spotřebu zbývá</span>
+      <span class="t-num${a && a.remaining < 0 ? ' bad' : ''}">${a ? `${a.remaining < 0 ? '−' : ''}${U.money(Math.abs(a.remaining))}` : '—'}</span>
+      <span class="t-note">${a ? `z ${U.money(st.pot)} na ${days(a.daysLeft)}` : 'čeká na výplatu'}</span></div>`;
 
     const notice = Store.mode === 'local'
       ? `<p class="notice">${window.KAPSA_DEMO ? 'Ukázka s vymyšlenými daty. Změny se ukládají jen v tomto prohlížeči.' : 'Data jsou zatím jen v tomto prohlížeči. Pro synchronizaci s mobilem propoj databázi podle návodu.'}</p>`
       : Store.mode === 'offline' ? '<p class="notice">Jsi offline, zobrazuji poslední uložená data.</p>' : '';
 
-    return `${head('Přehled', U.periodLabel(per, startDay()))}${notice}
+    return `${head('Přehled', U.periodLabel(st.per, startDay()))}${notice}
+      <section class="hero2">
+        <div class="hero-main"><p class="hero-lead">${lead}</p>${num ? `<p class="hero-num ${tone}">${num}</p>` : ''}${sub ? `<p class="hero-sub">${sub}</p>` : ''}</div>
+        <div class="tiles">${balTile}${potTile}</div>
+      </section>
       <div class="ov-grid">
         <div class="ov-main">
-          <section class="hero">${hero}${ribbon}</section>
+          ${accountsHTML()}
+          ${a ? burnHTML(st) : ''}
           ${inboxHTML()}
           ${splitHTML(st)}
+          ${obligationsHTML(st)}
           ${tipsHTML(2)}
           ${budgetsHTML(st)}
         </div>
         <div class="ov-side">
-          ${upcomingHTML()}
+          ${donutHTML(st)}
           ${goalsMini()}
           ${recentHTML()}
         </div>
       </div>`;
   }
 
+  // Zůstatky všech účtů
+  function accountsHTML(full = false) {
+    const list = accounts();
+    if (!list.length) return '';
+    const vals = list.map(a => ({ a, b: accBalance(a), czk: accCzk(a) }));
+    const total = vals.reduce((s, v) => s + (v.czk || 0), 0);
+    const missing = vals.filter(v => v.b == null).length;
+    const p = btcPrice();
+    const rows = vals.map(({ a, b, czk }) => {
+      let note = ACC_TYPES[a.type] || '';
+      if (a.is_main) note = 'rozpočet a denní limit';
+      if (b == null) note = 'zadej zůstatek';
+      else if ((a.type === 'investment' || a.type === 'crypto') && accInvested(a) && czk != null) {
+        const inv = accInvested(a), g = czk - inv;
+        note = `vloženo ${U.money(inv)}, ${g >= 0 ? '+' : '−'}${U.money(Math.abs(g))}`;
+      }
+      const main = b == null ? '<span class="muted">—</span>' : fmtAcc(a, b);
+      const sub2 = a.currency === 'BTC' && b != null ? `<span class="acc-sub">${czk != null ? `≈ ${U.money(czk)}` : 'bez kurzu'}</span>` : '';
+      return `<li><button class="arow2" data-action="acc" data-id="${a.id}"><span class="acc-mark" style="--c:${a.color}"></span>
+        <span class="row-main"><span>${U.esc(a.name)}</span><span class="tx-meta">${U.esc(note)}</span></span>
+        <span class="acc-val"><span class="pval">${main}</span>${sub2}</span></button></li>`;
+    }).join('');
+    return `<section class="block accounts"><div class="bhead"><h2>Účty</h2><span class="bsum">celkem ${U.money(total)}${missing ? '*' : ''}</span></div>
+      <ul class="acclist">${rows}</ul>
+      <div class="btnrow acc-actions"><button class="btn small" data-action="transfer-new">Převést mezi účty</button>${full ? '<button class="btn small ghost" data-action="acc-new">Přidat účet</button>' : '<a class="link" href="#ucty">Spravovat účty</a>'}</div>
+      ${missing ? `<p class="hint small">* Bez ${missing} ${U.plural(missing, 'účtu', 'účtů', 'účtů')}, u ${U.plural(missing, 'kterého', 'kterých', 'kterých')} chybí zůstatek.</p>` : ''}
+      ${list.some(a => a.currency === 'BTC') ? `<p class="hint small">${p ? `Kurz BTC ${U.money(p.price)}, ${p.source === 'manual' ? 'zadaný ručně' : p.source === 'demo' ? 'ukázkový' : 'z CoinGecko'} ${U.short(p.at)} ${U.time(p.at)}.` : 'Kurz BTC se nepodařilo načíst. Zadej ho u bitcoinového účtu.'}</p>` : ''}
+    </section>`;
+  }
+
+  // Průběh období: kumulované utrácení proti plánu a odhad do konce
+  function burnHTML(st) {
+    const per = st.per, n = per.days;
+    const ti = Math.min(n - 1, Math.max(0, U.daysBetween(per.start, new Date())));
+    const cum = [];
+    let acc = 0;
+    for (let i = 0; i <= ti; i++) {
+      acc += sum(st.variable.filter(t => inRange(t, U.addDays(per.start, i), U.addDays(per.start, i + 1))));
+      cum.push(acc);
+    }
+    const proj = acc / (ti + 1) * n;
+    const ymax = Math.max(st.pot, proj, acc, 1) * 1.08;
+    const X = i => ((i + 1) / n * 100).toFixed(2);
+    const Y = v => (100 - v / ymax * 100).toFixed(2);
+    const line = `M0,100 ${cum.map((v, i) => `L${X(i)},${Y(v)}`).join(' ')}`;
+    const over = proj > st.pot * 1.02;
+    const vs = 'vector-effect="non-scaling-stroke"';
+    return `<section class="block burn"><div class="bhead"><h2>Průběh období</h2><span class="bsum">${U.short(per.start)} – ${U.short(U.addDays(per.end, -1))}</span></div>
+      <div class="burn-box">
+        <svg viewBox="0 0 100 100" preserveAspectRatio="none" class="burn-svg" role="img" aria-label="Utraceno ${U.money(acc)} z plánu ${U.money(st.pot)}">
+          <line x1="0" y1="${Y(st.pot)}" x2="100" y2="${Y(st.pot)}" class="bc-limit" ${vs}/>
+          <line x1="0" y1="100" x2="100" y2="${Y(st.pot)}" class="bc-plan" ${vs}/>
+          <path d="${line} L${X(ti)},100 Z" class="bc-area"/>
+          <path d="${line}" class="bc-line" ${vs}/>
+          ${ti < n - 1 ? `<line x1="${X(ti)}" y1="${Y(acc)}" x2="100" y2="${Y(proj)}" class="bc-proj${over ? ' over' : ''}" ${vs}/>` : ''}
+        </svg>
+        <span class="bc-dot" style="left:${X(ti)}%;top:${Y(acc)}%"></span>
+      </div>
+      <div class="burn-axis"><span>${U.short(per.start)}</span><span>dnes</span><span>${U.short(U.addDays(per.end, -1))}</span></div>
+      <dl class="burn-legend">
+        <div><dt><i class="lg-line"></i>Utraceno</dt><dd>${U.money(acc)}</dd></div>
+        <div><dt><i class="lg-plan"></i>Plán na období</dt><dd>${U.money(st.pot)}</dd></div>
+        <div><dt><i class="lg-proj${over ? ' over' : ''}"></i>Tímhle tempem</dt><dd class="${over ? 'warn' : ''}">${U.money(round100(proj))}</dd></div>
+      </dl></section>`;
+  }
+
+  // Kam šly peníze v tomto období
+  function donutHTML(st) {
+    const ex = st.variable;
+    const total = sum(ex);
+    if (!total) return '';
+    const by = {};
+    ex.forEach(t => { const k = t.category_id || 'none'; by[k] = (by[k] || 0) + Number(t.amount); });
+    let rows = Object.entries(by).sort((a, b) => b[1] - a[1]).map(([id, v]) => {
+      const c = catById(id);
+      return { name: c ? c.name : 'Bez kategorie', color: c ? c.color : 'var(--ink-3)', v };
+    });
+    if (rows.length > 6) {
+      const rest = rows.slice(5).reduce((s, r) => s + r.v, 0);
+      rows = [...rows.slice(0, 5), { name: 'Ostatní kategorie', color: 'var(--fixed)', v: rest }];
+    }
+    let off = 0;
+    const segs = rows.map(r => {
+      const pct = r.v / total * 100;
+      const seg = `<circle cx="21" cy="21" r="15.915" fill="none" stroke="${r.color}" stroke-width="5.5" stroke-dasharray="${Math.max(0.1, pct - 0.6).toFixed(2)} ${(100 - Math.max(0.1, pct - 0.6)).toFixed(2)}" stroke-dashoffset="${(25 - off).toFixed(2)}"/>`;
+      off += pct;
+      return seg;
+    }).join('');
+    return `<section class="block"><div class="bhead"><h2>Kam jde spotřeba</h2></div>
+      <div class="donut-wrap">
+        <div class="donut"><svg viewBox="0 0 42 42" aria-hidden="true">${segs}</svg><div class="donut-c"><b>${U.money(total)}</b><span>bez pevných</span></div></div>
+        <ul class="donut-legend">${rows.map(r => `<li><span class="dot" style="--c:${r.color}"></span><span class="bname">${U.esc(r.name)}</span><span class="of">${Math.round(r.v / total * 100)} %</span></li>`).join('')}</ul>
+      </div></section>`;
+  }
+
   // Rozdělení výplaty: pevné výdaje, obálky na úspory, spotřeba
   function splitHTML(st, inPlan = false) {
     if (!st.income) {
-      return inPlan ? '' : `<section class="block"><div class="bhead"><h2>Výplata</h2></div>
-        <p class="lead-p">Až přijde výplata, zapiš ji. Nejdřív z ní odečtu pravidelné výdaje a zbytek rozdělím podle tvých procent.</p>
-        <button class="btn primary" data-action="add-income">Zapsat výplatu</button></section>`;
+      if (inPlan) return '';
+      const fixedNote = st.fixed ? ` Z výplaty pak nejdřív odečtu pevné výdaje ${U.money(st.fixed)}, zbytek rozdělím podle obálek.` : ' Odečtu z ní pevné výdaje a zbytek rozdělím podle obálek.';
+      return `<section class="block"><div class="bhead"><h2>Výplata</h2></div>
+        <p class="lead-p">${st.carry ? `Výplata za toto období ještě nepřišla. Zatím pracuješ se zbytkem z minula, ${U.money(st.carry)}.` : 'Výplata za toto období ještě nepřišla.'}${fixedNote}</p>
+        <button class="btn primary" data-action="salary">Výplata přišla</button></section>`;
     }
     const total = Math.max(st.income, st.fixed);
     const segs = [{ name: 'Pevné výdaje', amount: Math.min(st.fixed, total), color: 'var(--fixed)' }, ...st.buckets.map(b => ({ name: b.name, amount: b.amount, color: b.color }))];
-    const bar = `<div class="split" role="img" aria-label="Rozdělení výplaty">${segs.filter(s => s.amount > 0).map(s => `<span style="flex:${s.amount.toFixed(0)} 1 0;--c:${s.color}" title="${U.esc(s.name)}: ${U.money(s.amount)}"></span>`).join('')}</div>`;
-    const rows = [`<li class="srow"><span class="dot" style="--c:var(--fixed)"></span><span class="row-main"><span>Pevné výdaje</span><span class="tx-meta">zaplaceno ${U.money(st.fixedPaid)}${st.future ? `, čeká ${U.money(st.future)}` : ''}</span></span><span class="pval">${U.money(st.fixed)}</span></li>`]
+    const bar = `<div class="split" role="img" aria-label="Rozdělení výplaty">${segs.filter(x => x.amount > 0).map(x => `<span style="flex:${x.amount.toFixed(0)} 1 0;--c:${x.color}" title="${U.esc(x.name)}: ${U.money(x.amount)}"></span>`).join('')}</div>`;
+    const rows = [`<li class="srow"><span class="dot" style="--c:var(--fixed)"></span><span class="row-main"><span>Pevné výdaje</span><span class="tx-meta">zaplaceno ${U.money(st.fixedPaid)}${st.fixedOpen ? `, čeká ${U.money(st.fixedOpen)}` : ''}</span></span><span class="pval">${U.money(st.fixed)}</span></li>`]
       .concat(st.buckets.map(b => {
         let status;
-        if (b.type === 'spend') status = `<span class="tx-meta">utraceno ${U.money(st.variableSpent)}</span>`;
+        if (b.type === 'spend') status = `<span class="tx-meta">utraceno ${U.money(st.variableSpent)}${st.carry ? `, +${U.money(st.carry)} z minula` : ''}</span>`;
         else if (!st.incomeActual) status = `<span class="tx-meta">${b.pct} % ze zbytku</span>`;
         else if (b.done >= b.amount - 1) status = `<span class="tx-meta ok">${icon('check')}odloženo</span>`;
         else status = `<button class="link" data-action="transfer" data-b="${b.id}">Označit ${U.money(b.amount - b.done)} jako odložené</button>`;
         return `<li class="srow"><span class="dot" style="--c:${b.color}"></span><span class="row-main"><span>${U.esc(b.name)} <span class="muted">${b.pct} %</span></span>${status}</span><span class="pval">${U.money(b.amount)}</span></li>`;
       }));
-    const headRight = st.estimated ? `<span class="bsum">odhad ${U.money(st.income)}</span>` : `<span class="bsum">${U.money(st.income)}</span>`;
-    return `<section class="block split-block"><div class="bhead"><h2>${inPlan ? 'Toto období' : 'Rozdělení výplaty'}</h2>${headRight}</div>
-      ${st.estimated ? `<p class="hint">Výplata za toto období ještě nepřišla, počítám s minulou. <button class="link" data-action="add-income">Zapsat výplatu</button></p>` : ''}
+    const wait = '';
+    return `<section class="block split-block"><div class="bhead"><h2>${inPlan ? 'Toto období' : 'Rozdělení výplaty'}</h2><span class="bsum">${st.estimated ? `odhad ${U.money(st.income)}` : U.money(st.income)}</span></div>
+      ${wait}
       ${st.fixed > st.income ? `<p class="hint bad">Pevné výdaje jsou vyšší než příjem o ${U.money(st.fixed - st.income)}.</p>` : ''}
       ${bar}<ul class="rows">${rows.join('')}</ul></section>`;
+  }
+
+  // Pevné výdaje v tomto období: co odešlo a co ještě čeká
+  function obligationsHTML(st) {
+    const obl = st.obl.slice().sort((a, b) => a.done - b.done || b.planned - a.planned);
+    const extra = txIn(st.per.start, st.per.end, 'expense').filter(t => isFixedTx(t) && !t.recurring_id);
+    if (!obl.length && !extra.length) {
+      return `<section class="block"><div class="bhead"><h2>Pevné výdaje</h2></div>
+        <p class="empty">Přidej nájem, energie nebo předplatné. Kapsa s nimi bude počítat dopředu, ještě než odejdou. <a href="#plan" data-action="plan-tab" data-tab="pravidelne">Přidat pravidelný výdaj</a></p></section>`;
+    }
+    const rows = obl.map(o => {
+      let meta, act = '';
+      if (o.done) meta = `<span class="tx-meta ok">${icon('check')}zaplaceno ${U.short(o.paidTx[0].occurred_at)}</span>`;
+      else if (o.auto) meta = `<span class="tx-meta">strhne se ${U.short(o.due)}</span>`;
+      else { meta = '<span class="tx-meta">čeká, počítám s ním</span>'; act = `<button class="btn small" data-action="pay-rec" data-id="${o.r.id}">Zaplaceno</button>`; }
+      return `<li class="orow${o.done ? ' done' : ''}"><span class="dot" style="--c:${catColor(o.r.category_id)}"></span>
+        <span class="row-main"><span>${U.esc(o.r.name)}</span>${meta}</span>${act}<span class="pval">${U.money(o.done ? o.paid : o.planned)}</span></li>`;
+    });
+    if (extra.length) rows.push(`<li class="orow done"><span class="dot" style="--c:var(--fixed)"></span><span class="row-main"><span>Další v pevných kategoriích</span><span class="tx-meta">${extra.length}× ${U.plural(extra.length, 'platba', 'platby', 'plateb')}</span></span><span class="pval">${U.money(sum(extra))}</span></li>`);
+    return `<section class="block"><div class="bhead"><h2>Pevné výdaje</h2><span class="bsum">zaplaceno ${U.money(st.fixedPaid)} z ${U.money(st.fixed)}</span></div>
+      <ul class="rows">${rows.join('')}</ul></section>`;
   }
 
   function inboxHTML() {
@@ -484,7 +759,9 @@
   function inboxItem(t) {
     const sug = t.category_id && catById(t.category_id) ? t.category_id : matchRule(t.merchant);
     const chips = [];
-    if (sug) chips.push(`<button class="chip sug" data-action="confirm" data-id="${t.id}" data-cat="${sug}" style="--c:${catColor(sug)}">${icon('check')}${U.esc(catName(sug))}</button>`);
+    const rec = t.kind === 'expense' && isMainId(t.account_id) ? matchObligation(t.merchant, Number(t.amount), when(t)) : null;
+    if (rec) chips.push(`<button class="chip sug" data-action="link-rec" data-id="${t.id}" data-rec="${rec.id}" style="--c:${catColor(rec.category_id)}">${icon('check')}To je ${U.esc(rec.name)}</button>`);
+    if (sug) chips.push(`<button class="chip${rec ? '' : ' sug'}" data-action="confirm" data-id="${t.id}" data-cat="${sug}" style="--c:${catColor(sug)}">${icon('check')}${U.esc(catName(sug))}</button>`);
     topCats(t.kind, 5).filter(c => c.id !== sug).slice(0, sug ? 3 : 4).forEach(c => {
       chips.push(`<button class="chip" data-action="confirm" data-id="${t.id}" data-cat="${c.id}" style="--c:${c.color}"><span class="dot"></span>${U.esc(c.name)}</button>`);
     });
@@ -526,21 +803,6 @@
       <p class="hint small">Svislá čárka ukazuje, kolik z období už uběhlo.</p></section>`;
   }
 
-  function upcomingHTML() {
-    const today = U.startOfDay(new Date());
-    const to = U.addDays(today, 15);
-    const items = [];
-    D.recurring.filter(r => r.active).forEach(r => occurrences(r, today, to).forEach(d => items.push({ r, d })));
-    items.sort((a, b) => a.d - b.d);
-    if (!items.length) return '';
-    return `<section class="block"><div class="bhead"><h2>Brzy na řadě</h2><a class="link" href="#plan" data-action="plan-tab" data-tab="pravidelne">Upravit</a></div>
-      <ul class="rows">${items.slice(0, 6).map(({ r, d }) => {
-        const diff = U.daysBetween(today, d);
-        const dl = diff === 0 ? 'dnes' : diff === 1 ? 'zítra' : `za ${diff} ${U.plural(diff, 'den', 'dny', 'dní')}`;
-        return `<li class="row"><span class="dot" style="--c:${catColor(r.category_id)}"></span><span class="row-main"><span>${U.esc(r.name)}</span><span class="tx-meta">${dl}, ${U.short(d)}</span></span><span class="tx-amt ${r.kind === 'income' ? 'inc' : ''}">${r.kind === 'income' ? '+' : '−'}${U.money(r.amount)}</span></li>`;
-      }).join('')}</ul></section>`;
-  }
-
   function goalsMini() {
     if (!D.goals.length) return '';
     return `<section class="block"><div class="bhead"><h2>Cíle</h2><a class="link" href="#plan" data-action="plan-tab" data-tab="cile">Všechny</a></div>
@@ -561,11 +823,21 @@
       <ul class="txlist">${items.map(t => txRow(t, true)).join('')}</ul></section>`;
   }
 
+  // ---------- Účty ----------
+  function viewAccounts() {
+    const transfers = D.transactions.filter(t => t.kind === 'transfer').sort(byDateDesc).slice(0, 15);
+    return `${head('Účty', 'Zůstatky a převody')}
+      ${accountsHTML(true)}
+      <section class="block"><div class="bhead"><h2>Poslední převody</h2></div>
+        ${transfers.length ? `<ul class="txlist">${transfers.map(t => txRow(t, true)).join('')}</ul>` : '<p class="empty">Zatím žádné převody. Peníze mezi účty přesuneš tlačítkem Převést mezi účty.</p>'}</section>
+      <p class="hint">Rozpočet, denní limit a tipy počítají jen s účtem ${U.esc(mainAcc() ? mainAcc().name : 'Běžný účet')}. Převody mezi účty se nepočítají jako útrata.</p>`;
+  }
+
   // ---------- Pohyby ----------
   function viewTx() {
     const per = shiftPeriod(ui.txOffset);
     const catOpts = cats().map(c => `<option value="${c.id}"${ui.txCat === c.id ? ' selected' : ''}>${U.esc(c.name)}</option>`).join('');
-    const kinds = [['all', 'Vše'], ['expense', 'Výdaje'], ['income', 'Příjmy'], ['transfer', 'Odloženo'], ['pending', 'Ke kontrole']];
+    const kinds = [['all', 'Vše'], ['expense', 'Výdaje'], ['income', 'Příjmy'], ['transfer', 'Převody'], ['pending', 'Ke kontrole']];
     return `${head('Pohyby')}
       <div class="toolbar">
         <div class="pnav"><button class="icon-btn" data-action="tx-prev" aria-label="Předchozí období">${icon('left')}</button>
@@ -575,6 +847,7 @@
         <div class="filters">
           <div class="seg small" role="group" aria-label="Typ pohybu">${kinds.map(([k, l]) => `<button data-action="tx-kind" data-k="${k}" class="${ui.txKind === k ? 'on' : ''}" aria-pressed="${ui.txKind === k}">${l}</button>`).join('')}</div>
           <select id="tx-cat" class="select small" aria-label="Kategorie"><option value="">Všechny kategorie</option>${catOpts}</select>
+          ${accounts().length > 1 ? `<select id="tx-acc" class="select small" aria-label="Účet"><option value="">Všechny účty</option>${accounts().map(a => `<option value="${a.id}"${ui.txAcc === a.id ? ' selected' : ''}>${U.esc(a.name)}</option>`).join('')}</select>` : ''}
         </div>
       </div>
       <div id="txlist">${txListHTML()}</div>`;
@@ -583,13 +856,18 @@
   function txListHTML() {
     const per = shiftPeriod(ui.txOffset);
     const q = U.norm(ui.txSearch);
-    let list = q ? D.transactions.slice() : txIn(per.start, per.end);
+    let list = q ? D.transactions.slice() : txAny(per.start, per.end);
+    if (ui.txAcc) {
+      const acc = accById(ui.txAcc);
+      list = list.filter(t => (acc.is_main ? isMainId(t.account_id) : t.account_id === acc.id) || (t.kind === 'transfer' && transferTo(t) && transferTo(t).id === acc.id));
+    }
     if (ui.txKind === 'pending') list = list.filter(t => t.status === 'pending');
     else if (ui.txKind !== 'all') list = list.filter(t => t.kind === ui.txKind);
     if (ui.txCat) list = list.filter(t => t.category_id === ui.txCat);
     if (q) list = list.filter(t => U.norm(`${t.merchant} ${t.note} ${catName(t.category_id)}`).includes(q));
     list.sort(byDateDesc);
-    const ex = sum(list.filter(t => t.kind === 'expense')), inc = sum(list.filter(t => t.kind === 'income')), tr = sum(list.filter(t => t.kind === 'transfer'));
+    const czkOnly = t => (accById(t.account_id) || {}).currency !== 'BTC';
+    const ex = sum(list.filter(t => t.kind === 'expense' && czkOnly(t))), inc = sum(list.filter(t => t.kind === 'income' && czkOnly(t))), tr = sum(list.filter(t => t.kind === 'transfer' && czkOnly(t)));
     if (!list.length) return `<p class="empty pad">${q ? 'Nic takového jsem nenašel. Zkus jiné slovo.' : 'V tomhle období tu nic není.'}</p>`;
     const groups = [];
     list.slice(0, 400).forEach(t => {
@@ -597,11 +875,11 @@
       if (!groups.length || groups[groups.length - 1].k !== k) groups.push({ k, d: when(t), items: [] });
       groups[groups.length - 1].items.push(t);
     });
-    return `<p class="totals">${q ? 'Ve všech obdobích: ' : ''}výdaje <b>${U.money(ex)}</b>, příjmy <b class="inc">${U.money(inc)}</b>${tr ? `, odloženo <b>${U.money(tr)}</b>` : ''}</p>
+    return `<p class="totals">${q ? 'Ve všech obdobích: ' : ''}výdaje <b>${U.money(ex)}</b>, příjmy <b class="inc">${U.money(inc)}</b>${tr ? `, převody <b>${U.money(tr)}</b>` : ''}</p>
       ${groups.map(g => {
-        const dayEx = sum(g.items.filter(t => t.kind === 'expense'));
+        const dayEx = sum(g.items.filter(t => t.kind === 'expense' && czkOnly(t)));
         return `<section class="day"><h3 class="dayhead"><span>${U.dayLabel(g.d)}${U.daysBetween(g.d, new Date()) > 1 ? '' : ` ${U.short(g.d)}`}</span>${dayEx ? `<span>−${U.money(dayEx)}</span>` : ''}</h3>
-        <ul class="txlist">${g.items.map(t => txRow(t)).join('')}</ul></section>`;
+        <ul class="txlist">${g.items.map(t => txRow(t, false, ui.txAcc ? accById(ui.txAcc) : null)).join('')}</ul></section>`;
       }).join('')}`;
   }
 
@@ -609,6 +887,8 @@
     const s = $('#tx-search'), c = $('#tx-cat');
     s.addEventListener('input', () => { ui.txSearch = s.value; $('#txlist').innerHTML = txListHTML(); });
     c.addEventListener('change', () => { ui.txCat = c.value; $('#txlist').innerHTML = txListHTML(); });
+    const ac = $('#tx-acc');
+    if (ac) ac.addEventListener('change', () => { ui.txAcc = ac.value; $('#txlist').innerHTML = txListHTML(); });
   }
 
   // ---------- Reporty ----------
@@ -729,12 +1009,14 @@
         <span class="with-unit pct"><input class="input" name="pct" inputmode="decimal" value="${b.pct}" aria-label="Procento pro ${U.esc(b.name)}"><span>%</span></span>
         <span class="a-kc pval">${U.money(st.remainder * (Number(b.pct) || 0) / 100)}</span>
         ${b.type === 'spend' ? '<span class="a-type">spotřeba</span>' : `<button type="button" class="icon-btn small" data-action="alloc-del" data-i="${i}" aria-label="Odebrat obálku ${U.esc(b.name)}">${icon('close')}</button>`}
+        ${b.type === 'save' && accounts().length > 1 ? `<label class="a-acc"><span>Posílat na</span><select class="select small" name="acc"><option value="">Neurčeno</option>${accounts().filter(a => !a.is_main).map(a => `<option value="${a.id}"${a.id === b.account_id ? ' selected' : ''}>${U.esc(a.name)}</option>`).join('')}</select></label>` : ''}
       </li>`).join('');
     return `<p class="lead-p">Z každé výplaty nejdřív odečtu pravidelné a pevné výdaje. Zbytek rozdělím podle procent níže. Ze spotřeby se pak počítá denní limit a limity kategorií, ostatní obálky jsou peníze, které pošleš stranou.</p>
       ${st.income ? `<section class="block calc"><ul class="rows">
         <li class="row"><span class="row-main"><span>Příjem v tomto období${st.estimated ? ' (odhad podle minulého)' : ''}</span></span><span class="pval">${U.money(st.income)}</span></li>
         <li class="row"><span class="row-main"><span>Pevné a pravidelné výdaje</span></span><span class="pval">−${U.money(st.fixed)}</span></li>
-        <li class="row total"><span class="row-main"><span>K rozdělení</span></span><span class="pval">${U.money(st.remainder)}</span></li></ul></section>` : ''}
+        <li class="row total"><span class="row-main"><span>K rozdělení</span></span><span class="pval">${U.money(st.remainder)}</span></li></ul>
+        ${st.carry ? `<p class="hint small">Ke spotřebě se navíc přičítá ${U.money(st.carry)}, které zbyly z minulého období.</p>` : ''}</section>` : ''}
       <section class="block"><div class="bhead"><h2>Obálky</h2><button class="link" data-action="alloc-add">Přidat obálku</button></div>
         <form id="alloc-form" novalidate><ul class="alloc">${rows}</ul>
         <p class="alloc-sum ${total === 100 ? 'ok' : 'bad'}" id="alloc-sum">${total === 100 ? 'Součet 100 %.' : `Součet je ${U.num(total)} %, ${total < 100 ? `chybí ${U.num(100 - total)} %` : `přebývá ${U.num(total - 100)} %`}.`}</p>
@@ -753,6 +1035,7 @@
       if (!li) return;
       const b = ui.allocDraft[Number(li.dataset.i)];
       if (e.target.name === 'name') b.name = e.target.value;
+      if (e.target.name === 'acc') b.account_id = e.target.value || null;
       if (e.target.name === 'pct') {
         b.pct = U.parseAmount(e.target.value) || 0;
         li.querySelector('.a-kc').textContent = U.money(st.remainder * b.pct / 100);
@@ -802,14 +1085,24 @@
   }
 
   function planRecurring() {
-    const list = D.recurring.slice().sort((a, b) => (b.active - a.active) || a.next_date.localeCompare(b.next_date));
+    const obl = new Map(obligations(curPeriod()).map(o => [o.r.id, o]));
+    const list = D.recurring.slice().sort((a, b) => (b.active - a.active) || (a.kind === b.kind ? 0 : a.kind === 'expense' ? -1 : 1) || b.amount - a.amount);
     const out = list.filter(r => r.active && r.kind === 'expense').reduce((s, r) => s + r.amount * U.monthlyFactor(r.every), 0);
-    const inn = list.filter(r => r.active && r.kind === 'income').reduce((s, r) => s + r.amount * U.monthlyFactor(r.every), 0);
-    return `<p class="lead-p">${list.length ? `Měsíčně pravidelně odchází ${U.money(out)}${inn ? ` a přichází ${U.money(inn)}` : ''}. V den splatnosti se platba zapíše sama.` : 'Přidej nájem, energie, předplatné nebo splátky. Odečtou se z výplaty ještě před rozdělením a v den splatnosti se zapíšou samy.'}</p>
-      <section class="block"><div class="bhead"><h2>Pravidelné platby</h2><button class="link" data-action="add-rec">Přidat platbu</button></div>
-      ${list.length ? `<ul class="plist">${list.map(r => `<li><button class="prow${r.active ? '' : ' off'}" data-action="edit-rec" data-id="${r.id}"><span class="dot" style="--c:${catColor(r.category_id)}"></span>
-        <span class="row-main"><span>${U.esc(r.name)}</span><span class="tx-meta">${r.active ? `${U.everyLabel(r.every)}, příště ${U.shortY(U.parseISODate(r.next_date))}` : 'pozastaveno'}</span></span>
-        <span class="pval tx-amt ${r.kind === 'income' ? 'inc' : ''}">${r.kind === 'income' ? '+' : '−'}${U.money(r.amount)}</span></button></li>`).join('')}</ul>` : ''}
+    const row = r => {
+      const o = obl.get(r.id);
+      let status = r.active ? '' : 'pozastaveno';
+      if (r.active && r.kind === 'expense' && o) status = o.done ? `zaplaceno ${U.short(o.paidTx[0].occurred_at)}` : o.auto ? `příště ${U.short(o.due)}` : 'v tomto období čeká';
+      if (r.active && r.kind === 'income') status = r.next_date ? `příště ${U.short(U.parseISODate(r.next_date))}` : 'příjem';
+      const when2 = r.next_date ? 'strhává se samo' : r.every === 'month' ? '' : U.everyLabel(r.every);
+      const pay = r.active && r.kind === 'expense' && o && !o.done && !o.auto;
+      return `<li class="prow-wrap"><button class="prow${r.active ? '' : ' off'}" data-action="edit-rec" data-id="${r.id}"><span class="dot" style="--c:${catColor(r.category_id)}"></span>
+        <span class="row-main"><span>${U.esc(r.name)}</span><span class="tx-meta">${[status, when2].filter(Boolean).join(', ')}</span></span>
+        <span class="pval tx-amt ${r.kind === 'income' ? 'inc' : ''}">${r.kind === 'income' ? '+' : '−'}${U.money(r.amount)}</span></button>
+        ${pay ? `<button class="btn small" data-action="pay-rec" data-id="${r.id}">Zaplaceno</button>` : ''}</li>`;
+    };
+    return `<p class="lead-p">${list.length ? `S pravidelnými výdaji ${U.money(out)} měsíčně počítám dopředu, hned jak přijde výplata. Do pohybů se zapíšou, až skutečně odejdou: z Apple Pay, z výpisu, nebo když ťukneš na Zaplaceno.` : 'Přidej nájem, energie, předplatné nebo splátky. Nemusíš vědět, kdy je pošleš: Kapsa s nimi počítá dopředu a zapíše je, až odejdou.'}</p>
+      <section class="block"><div class="bhead"><h2>Pravidelné výdaje</h2><button class="link" data-action="add-rec">Přidat</button></div>
+      ${list.length ? `<ul class="plist">${list.map(row).join('')}</ul>` : ''}
       </section>`;
   }
 
@@ -856,7 +1149,7 @@
         <ol class="steps">
           <li>Otevři Zkratky, záložku Automatizace, a přidej novou automatizaci <b>Transakce</b>. Vyber svou kartu, zvol <b>Spustit okamžitě</b>.</li>
           <li>Přidej akci <b>Získat obsah URL</b> s adresou níže, metodou POST a hlavičkou <code>apikey</code>.</li>
-          <li>Do těla požadavku (JSON) přidej pole <code>p_token</code>, <code>p_amount</code> (proměnná Částka) a <code>p_merchant</code> (proměnná Obchodník).</li>
+          <li>Do těla požadavku (JSON) přidej pole <code>p_token</code>, <code>p_amount</code> (proměnná Částka) a <code>p_merchant</code> (proměnná Obchodník) a <code>p_card</code> (proměnná Karta nebo propustka). Podle karty Kapsa pozná, na který účet platba patří.</li>
           <li>Volitelně přidej <b>Získat hodnotu slovníku</b> pro klíč <code>zprava</code> a <b>Zobrazit oznámení</b>. Uvidíš, kolik ti v kategorii zbývá.</li>
         </ol>
         ${copyRow('Adresa', Store.captureUrl())}
@@ -904,13 +1197,15 @@
     let pickId = kind === 'transfer' ? t.bucket : t.category_id;
     let userPicked = !!pickId;
     const amountVal = t.amount === '' ? '' : String(t.amount).replace('.', ',');
-    const title = isNew ? (kind === 'income' ? 'Nový příjem' : 'Nový pohyb') : t.status === 'pending' ? 'Zařadit platbu' : 'Upravit pohyb';
+    const title = isNew ? (preset.merchant === 'Výplata' ? 'Výplata' : kind === 'income' ? 'Nový příjem' : 'Nový pohyb') : t.status === 'pending' ? 'Zařadit platbu' : 'Upravit pohyb';
     openSheet(`<form class="form" novalidate>
       ${sheetHead(title)}
-      <div class="seg full" role="group" aria-label="Typ"><button type="button" data-k="expense">Výdaj</button><button type="button" data-k="income">Příjem</button><button type="button" data-k="transfer">Odložení</button></div>
+      <div class="seg full" role="group" aria-label="Typ"><button type="button" data-k="expense">Výdaj</button><button type="button" data-k="income">Příjem</button><button type="button" data-k="transfer">Převod</button></div>
       <label class="amount-field"><span class="sr">Částka v korunách</span><input name="amount" inputmode="decimal" autocomplete="off" placeholder="0" value="${U.esc(amountVal)}"><span class="cur">Kč</span></label>
       <p class="hint kind-hint"></p>
       <div class="chips wrap" id="pick"></div>
+      ${accounts().length > 1 ? `<label class="field acc-field"><span>Účet</span><select class="select" name="acc">${accounts().map(a => `<option value="${a.id}"${(t.account_id ? t.account_id === a.id : a.is_main) ? ' selected' : ''}>${U.esc(a.name)}</option>`).join('')}</select></label>` : ''}
+      ${D.recurring.some(r => r.kind === 'expense') ? `<label class="field rec-field"><span>Pravidelný výdaj</span><select class="select" name="rec"><option value="">Ne, běžná platba</option>${D.recurring.filter(r => r.kind === 'expense').map(r => `<option value="${r.id}"${r.id === t.recurring_id ? ' selected' : ''}>${U.esc(r.name)}</option>`).join('')}</select></label>` : ''}
       <label class="field"><span>Obchodník nebo popis</span><input class="input" name="merchant" value="${U.esc(t.merchant || '')}" autocomplete="off"></label>
       <div class="field-row">
         <label class="field"><span>Kdy</span><input class="input" type="datetime-local" name="when" value="${U.toLocalInput(t.occurred_at)}"></label>
@@ -929,9 +1224,12 @@
         hint.textContent = kind === 'transfer' ? 'Peníze poslané stranou na spořicí účet nebo do investic. Nepočítají se jako útrata.'
           : kind === 'income' ? 'Výplata se hned rozdělí podle tvých procent.' : '';
         hint.hidden = !hint.textContent;
+        const rf = sheet.querySelector('.rec-field');
+        if (rf) rf.hidden = kind !== 'expense';
       };
       paint();
       segBtns.forEach(b => b.addEventListener('click', () => {
+        if (b.dataset.k === 'transfer' && isNew) { transferSheet(null, { amount: U.parseAmount(form.amount.value) || '' }); return; }
         kind = b.dataset.k;
         const valid = kind === 'transfer' ? !!bucketById(pickId) && bucketById(pickId).type === 'save' : catById(pickId) && catById(pickId).kind === kind;
         if (!valid) { pickId = kind === 'transfer' ? (alloc().find(x => x.type === 'save') || {}).id : null; userPicked = false; }
@@ -966,6 +1264,11 @@
           occurred_at: form.when.value ? new Date(form.when.value).toISOString() : new Date().toISOString(),
           status: 'confirmed',
         };
+        const accSel = form.acc ? accById(form.acc.value) : mainAcc();
+        row.account_id = accSel && !accSel.is_main ? accSel.id : null;
+        const recSel = kind === 'expense' && form.rec && !row.account_id ? D.recurring.find(r => r.id === form.rec.value) : null;
+        row.recurring_id = recSel ? recSel.id : null;
+        if (recSel && !row.category_id) row.category_id = recSel.category_id;
         const st0 = periodStats(curPeriod());
         const c = kind === 'expense' ? catById(pickId) : null;
         const prev = c ? budgetState(c, st0).spent : 0;
@@ -973,6 +1276,7 @@
           if (isNew) await Store.insert('transactions', { ...row, source: 'manual' });
           else await Store.update('transactions', t.id, row);
           if (kind !== 'transfer' && row.merchant && pickId && (isNew || pickId !== tx.category_id || tx.status === 'pending')) await learnRule(row.merchant, pickId);
+          if (recSel && !recSel.pattern && row.merchant) await Store.update('recurring', recSel.id, { pattern: U.patternFor(row.merchant) });
           closeSheet();
           render();
           if (kind === 'income' && isNew) {
@@ -983,6 +1287,170 @@
         } catch (ex) { fail(ex); }
       });
       if (isNew) form.amount.focus();
+    });
+  }
+
+  function transferSheet(tx, preset = {}) {
+    const isNew = !tx;
+    const list = accounts();
+    if (list.length < 2) { toast('Pro převod potřebuješ aspoň dva účty. Přidej je v Účtech.', 'warn'); return; }
+    const main = mainAcc();
+    const t = tx || { amount: '', amount_to: null, account_id: null, to_account_id: null, as_income: false, merchant: '', note: '', occurred_at: new Date().toISOString(), ...preset };
+    const fromId = t.account_id || (main ? main.id : list[0].id);
+    const toAcc = tx ? transferTo(tx) : (preset.to ? accById(preset.to) : list.find(a => a.id !== fromId));
+    const opts = sel => list.map(a => `<option value="${a.id}"${a.id === sel ? ' selected' : ''}>${U.esc(a.name)}</option>`).join('');
+    closeSheet();
+    openSheet(`<form class="form" novalidate>
+      ${sheetHead(isNew ? 'Převod mezi účty' : 'Upravit převod')}
+      <div class="field-row">
+        <label class="field"><span>Z účtu</span><select class="select" name="from">${opts(fromId)}</select></label>
+        <label class="field"><span>Na účet</span><select class="select" name="to">${opts(toAcc ? toAcc.id : '')}</select></label>
+      </div>
+      <label class="amount-field"><span class="sr">Částka</span><input name="amount" inputmode="decimal" autocomplete="off" placeholder="0" value="${t.amount === '' ? '' : U.esc(String(t.amount).replace('.', ','))}"><span class="cur" id="cur-from">Kč</span></label>
+      <label class="field to-field"><span id="to-label">Připsáno</span><span class="with-unit"><input class="input" name="amount_to" inputmode="decimal" value="${t.amount_to != null ? U.esc(String(t.amount_to).replace('.', ',')) : ''}"><span id="cur-to">BTC</span></span></label>
+      <p class="hint to-hint"></p>
+      <label class="check income-check"><input type="checkbox" name="as_income"${t.as_income ? ' checked' : ''}><span>Započítat do rozpočtu jako příjem</span></label>
+      <p class="hint income-hint">Třeba výběr z podnikání pro sebe. Rozdělí se jako výplata: pevné výdaje, obálky, spotřeba.</p>
+      <div class="field-row">
+        <label class="field"><span>Kdy</span><input class="input" type="datetime-local" name="when" value="${U.toLocalInput(t.occurred_at)}"></label>
+        <label class="field"><span>Poznámka</span><input class="input" name="note" value="${U.esc(t.note || t.merchant || '')}" autocomplete="off"></label>
+      </div>
+      <p class="form-err" role="alert"></p>
+      <div class="sheet-actions">${isNew ? '' : '<button type="button" class="btn ghost danger" data-del>Smazat</button>'}<button class="btn primary" type="submit">${isNew ? 'Převést' : 'Uložit změny'}</button></div>
+    </form>`, sheet => {
+      const form = sheet.querySelector('form');
+      let incomeTouched = !isNew;
+      const paint = () => {
+        const f = accById(form.from.value), to = accById(form.to.value);
+        const cross = f && to && f.currency !== to.currency;
+        sheet.querySelector('#cur-from').textContent = f && f.currency === 'BTC' ? 'BTC' : 'Kč';
+        sheet.querySelector('.to-field').hidden = !cross;
+        sheet.querySelector('#cur-to').textContent = to && to.currency === 'BTC' ? 'BTC' : 'Kč';
+        sheet.querySelector('#to-label').textContent = to && to.currency === 'BTC' ? 'Koupeno bitcoinu' : 'Připsáno v korunách';
+        const p = btcPrice();
+        const hint = sheet.querySelector('.to-hint');
+        hint.hidden = !cross;
+        hint.textContent = cross ? (p ? `Podle kurzu ${U.money(p.price)} za 1 BTC by to bylo kolem ${to.currency === 'BTC' ? fmtBtc((U.parseAmount(form.amount.value) || 0) / p.price) : U.money((U.parseAmount(form.amount.value) || 0) * p.price)}. Zadej, kolik skutečně přišlo.` : 'Zadej, kolik skutečně přišlo.') : '';
+        const toMain = to && to.is_main && f && !f.is_main;
+        sheet.querySelector('.income-check').hidden = !toMain;
+        sheet.querySelector('.income-hint').hidden = !toMain;
+        if (toMain && !incomeTouched) form.as_income.checked = f.type === 'business';
+      };
+      paint();
+      form.addEventListener('change', e => { if (e.target.name === 'as_income') incomeTouched = true; paint(); });
+      form.amount.addEventListener('input', paint);
+      const del = sheet.querySelector('[data-del]');
+      if (del) del.addEventListener('click', () => deleteTx(t.id));
+      form.addEventListener('submit', async e => {
+        e.preventDefault();
+        const err = sheet.querySelector('.form-err');
+        const f = accById(form.from.value), to = accById(form.to.value);
+        if (!f || !to || f.id === to.id) { err.textContent = 'Vyber dva různé účty.'; return; }
+        const amount = U.parseAmount(form.amount.value);
+        if (!amount || amount <= 0) { err.textContent = 'Zadej částku větší než nula.'; form.amount.focus(); return; }
+        const cross = f.currency !== to.currency;
+        const amountTo = cross ? U.parseAmount(form.amount_to.value) : null;
+        if (cross && (!amountTo || amountTo <= 0)) { err.textContent = 'Zadej, kolik na cílový účet přišlo.'; return; }
+        const bucket = f.is_main ? alloc().find(b => b.type === 'save' && b.account_id === to.id) : null;
+        const row = {
+          kind: 'transfer', amount, amount_to: amountTo, account_id: f.is_main ? null : f.id, to_account_id: to.id,
+          as_income: !!(to.is_main && !f.is_main && form.as_income.checked), bucket: bucket ? bucket.id : null, category_id: null,
+          merchant: form.note.value.trim() || `${f.name} → ${to.name}`, note: null,
+          occurred_at: form.when.value ? new Date(form.when.value).toISOString() : new Date().toISOString(), status: 'confirmed',
+        };
+        try {
+          if (isNew) await Store.insert('transactions', { ...row, source: 'manual' });
+          else await Store.update('transactions', t.id, row);
+          closeSheet(); render();
+          toast(`${isNew ? 'Převedeno' : 'Uloženo'} ${fmtAcc(f, amount)}: ${f.name} → ${to.name}${row.as_income ? '. Započteno jako příjem.' : ''}`);
+        } catch (ex) { fail(ex); }
+      });
+      if (isNew) form.amount.focus();
+    });
+  }
+
+  // Detail účtu: zůstatek, pohyby, srovnání s bankou, úpravy
+  function accountSheet(a) {
+    if (!a) return;
+    const isNew = !a.id;
+    const bal = isNew ? null : accBalance(a);
+    const czk = isNew ? null : accCzk(a);
+    const recent = isNew ? [] : D.transactions.filter(t => (a.is_main ? (t.kind === 'transfer' ? isMainId(t.account_id) : isMainId(t.account_id)) : t.account_id === a.id) || (t.kind === 'transfer' && transferTo(t) && transferTo(t).id === a.id)).sort(byDateDesc).slice(0, 12);
+    const p = btcPrice();
+    const market = a.type === 'investment' || a.type === 'crypto';
+    openSheet(`<form class="form" novalidate>
+      ${sheetHead(isNew ? 'Nový účet' : U.esc(a.name))}
+      ${isNew ? '' : `<div class="acc-head"><p class="acc-big">${bal == null ? 'Zůstatek zatím nezadaný' : fmtAcc(a, bal)}</p>
+        ${a.currency === 'BTC' && czk != null ? `<p class="vsub">≈ ${U.money(czk)}</p>` : ''}
+        ${market && accInvested(a) && czk != null ? (() => { const inv = accInvested(a), g = czk - inv; return `<p class="vsub">Vloženo ${U.money(inv)}, ${g >= 0 ? 'zisk' : 'ztráta'} ${U.money(Math.abs(g))} (${g >= 0 ? '+' : '−'}${Math.abs(Math.round(g / inv * 100))} %)</p>`; })() : ''}
+        <div class="btnrow"><button type="button" class="btn small primary" data-act="transfer">Převést</button></div></div>`}
+      <label class="field"><span>${market ? (a.currency === 'BTC' ? 'Kolik bitcoinu teď máš' : 'Aktuální hodnota') : 'Aktuální zůstatek z banky'}</span>
+        <span class="with-unit"><input class="input" name="anchor" inputmode="decimal" value="${bal != null ? U.esc(String(Math.round(bal * (a.currency === 'BTC' ? 1e8 : 100)) / (a.currency === 'BTC' ? 1e8 : 100)).replace('.', ',')) : ''}" placeholder="${a.currency === 'BTC' ? '0,0000' : '0'}"><span class="unit">${a.currency === 'BTC' ? 'BTC' : 'Kč'}</span></span></label>
+      <p class="hint">${market ? 'Hodnota investic se mění s trhem. Občas ji sem opiš a Kapsa spočítá zisk.' : 'Opiš zůstatek z bankovnictví. Kapsa k němu pak přičítá a odečítá pohyby.'}</p>
+      ${a.currency === 'BTC' || (isNew && false) ? `<label class="field"><span>Kurz 1 BTC</span><span class="with-unit"><input class="input" name="price" inputmode="decimal" value="${p ? U.num(p.price) : ''}"><span>Kč</span></span></label>` : ''}
+      <details class="acc-edit"${isNew ? ' open' : ''}><summary>Nastavení účtu</summary>
+        <div class="form inner">
+        <label class="field"><span>Název</span><input class="input" name="name" value="${U.esc(a.name || '')}" autocomplete="off"></label>
+        ${a.is_main ? '' : `<div class="field-row">
+          <label class="field"><span>Druh</span><select class="select" name="type">${Object.entries(ACC_TYPES).filter(([k]) => k !== 'checking' || !a.is_main).map(([k, l]) => `<option value="${k}"${a.type === k ? ' selected' : ''}>${l}</option>`).join('')}</select></label>
+          <label class="field"><span>Měna</span><select class="select" name="currency"${isNew ? '' : ' disabled'}><option value="CZK"${a.currency !== 'BTC' ? ' selected' : ''}>Koruny</option><option value="BTC"${a.currency === 'BTC' ? ' selected' : ''}>Bitcoin</option></select></label></div>`}
+        ${market || isNew ? `<label class="field invested-field"><span>Kolik jsi do toho celkem vložil</span><span class="with-unit"><input class="input" name="invested" inputmode="decimal" value="${!isNew && accInvested(a) ? U.num(accInvested(a)) : ''}" placeholder="nepovinné"><span>Kč</span></span></label>` : ''}
+        ${a.currency === 'BTC' || a.is_main ? '' : `<label class="field"><span>Karta v Peněžence (nepovinné)</span><input class="input" name="card" value="${U.esc(a.card_name || '')}" placeholder="např. Firemní Visa" autocomplete="off"></label>
+        <p class="hint">Platby touto kartou přes Apple Pay se zapíšou na tento účet, ne do osobního rozpočtu.</p>`}
+        <fieldset class="field"><legend>Barva</legend><div class="swatches">${SWATCHES.map(c => `<button type="button" class="sw${c === a.color ? ' on' : ''}" data-c="${c}" style="--c:${c}" aria-label="Barva ${c}" aria-pressed="${c === a.color}"></button>`).join('')}</div></fieldset>
+        </div>
+      </details>
+      ${recent.length ? `<div><h3 class="dayhead"><span>Poslední pohyby</span></h3><ul class="txlist">${recent.map(t => txRow(t, true, a)).join('')}</ul></div>` : ''}
+      <p class="form-err" role="alert"></p>
+      <div class="sheet-actions">${isNew || a.is_main ? '' : '<button type="button" class="btn ghost danger" data-del>Skrýt účet</button>'}<button class="btn primary" type="submit">${isNew ? 'Přidat účet' : 'Uložit'}</button></div>
+    </form>`, sheet => {
+      const form = sheet.querySelector('form');
+      let color = a.color || SWATCHES[2];
+      sheet.querySelector('.swatches').addEventListener('click', e => {
+        const b = e.target.closest('.sw'); if (!b) return;
+        color = b.dataset.c;
+        sheet.querySelectorAll('.sw').forEach(x => { x.classList.toggle('on', x === b); x.setAttribute('aria-pressed', x === b); });
+      });
+      const tr = sheet.querySelector('[data-act=transfer]');
+      if (tr) tr.addEventListener('click', () => transferSheet(null, a.is_main ? {} : { account_id: a.id }));
+      const del = sheet.querySelector('[data-del]');
+      if (del) del.addEventListener('click', async () => {
+        if (!confirm('Skrýt účet? Pohyby zůstanou zachované.')) return;
+        try { await Store.update('accounts', a.id, { archived: true }); closeSheet(); render(); toast('Účet skrytý'); } catch (e) { fail(e); }
+      });
+      form.addEventListener('submit', async e => {
+        e.preventDefault();
+        const err = sheet.querySelector('.form-err');
+        const name = form.name.value.trim();
+        if (!name) { err.textContent = 'Účet potřebuje název.'; sheet.querySelector('.acc-edit').open = true; return; }
+        const currency = form.currency ? form.currency.value : (a.currency || 'CZK');
+        const row = { name, color, card_name: form.card ? (form.card.value.trim() || null) : null };
+        if (form.type) row.type = currency === 'BTC' ? 'crypto' : form.type.value;
+        if (isNew) row.currency = currency;
+        const invNow = isNew ? null : accInvested(a);
+        const invField = form.invested ? (U.parseAmount(form.invested.value) || null) : undefined;
+        const av = form.anchor.value.trim() === '' ? null : U.parseAmount(form.anchor.value);
+        const changed = av != null && (bal == null || Math.abs(av - bal) > (currency === 'BTC' ? 1e-9 : 0.004));
+        if (changed) { row.anchor = av; row.anchor_at = new Date().toISOString(); }
+        // vložená částka se ukládá k okamžiku posledního srovnání hodnoty
+        if (invField !== undefined) {
+          if (isNew || changed) row.invested = invField;
+          else if (invField == null) row.invested = null;
+          else if (invNow == null || Math.abs(invField - invNow) >= 0.5) row.invested = (a.invested || 0) + (invField - (invNow || 0));
+        } else if (changed && invNow != null) row.invested = invNow;
+        try {
+          if (form.price) { const pv = U.parseAmount(form.price.value); if (pv > 0 && (!p || Math.abs(pv - p.price) >= 1)) setBtcPrice(pv, 'manual'); }
+          if (isNew) await Store.insert('accounts', { ...row, sort: (D.accounts || []).length, is_main: false, archived: false });
+          else await Store.update('accounts', a.id, row);
+          closeSheet(); render();
+          if (changed && bal != null && !market) {
+            const diff = av - bal;
+            toast(`Srovnáno. Kapsa se lišila o ${fmtAcc(a, Math.abs(diff))}, ${diff < 0 ? 'nejspíš chybí zapsaný výdaj' : 'nejspíš chybí zapsaný příjem'}.`, 'warn');
+          } else toast(isNew ? 'Účet přidán' : 'Uloženo');
+        } catch (ex) { fail(ex); }
+      });
+      const typeSel = form.type, curSel = form.currency;
+      if (curSel && isNew) curSel.addEventListener('change', () => { if (curSel.value === 'BTC') typeSel.value = 'crypto'; });
     });
   }
 
@@ -1112,52 +1580,131 @@
 
   function recSheet(rec, preset = {}) {
     const isNew = !rec;
-    const r = rec || { name: '', amount: '', kind: 'expense', category_id: null, every: 'month', next_date: '', active: true, ...preset };
+    const r = rec || { name: '', amount: '', kind: 'expense', category_id: null, every: 'month', next_date: null, pattern: '', active: true, ...preset };
     let kind = r.kind;
     const catOptions = k => `<option value="">Bez kategorie</option>` + cats(k).map(c => `<option value="${c.id}"${c.id === r.category_id ? ' selected' : ''}>${U.esc(c.name)}</option>`).join('');
     openSheet(`<form class="form" novalidate>
-      ${sheetHead(isNew ? 'Nová pravidelná platba' : 'Upravit pravidelnou platbu')}
+      ${sheetHead(isNew ? 'Nový pravidelný výdaj' : 'Upravit pravidelný výdaj')}
       <div class="seg full" role="group" aria-label="Typ"><button type="button" data-k="expense">Výdaj</button><button type="button" data-k="income">Příjem</button></div>
       <label class="field"><span>Název</span><input class="input" name="name" value="${U.esc(r.name)}" placeholder="např. Nájem" autocomplete="off"></label>
       <div class="field-row">
         <label class="field"><span>Částka</span><span class="with-unit"><input class="input" name="amount" inputmode="decimal" value="${r.amount ? U.num(r.amount) : ''}"><span>Kč</span></span></label>
-        <label class="field"><span>Opakování</span><select class="select" name="every">${['week', 'month', 'quarter', 'year'].map(e => `<option value="${e}"${r.every === e ? ' selected' : ''}>${U.cap(U.everyLabel(e))}</option>`).join('')}</select></label>
-      </div>
-      <div class="field-row">
-        <label class="field"><span>Příští platba</span><input class="input" type="date" name="next" value="${r.next_date || ''}"></label>
         <label class="field"><span>Kategorie</span><select class="select" name="cat">${catOptions(kind)}</select></label>
       </div>
+      <p class="hint">Když se částka mění, třeba u energií, zadej odhad. Do pohybů se zapíše skutečná.</p>
+      <div class="field-row">
+        <label class="field"><span>Opakování</span><select class="select" name="every">${[['month', 'Každé období'], ['quarter', 'Čtvrtletně'], ['year', 'Ročně']].map(([v, l]) => `<option value="${v}"${r.every === v ? ' selected' : ''}>${l}</option>`).join('')}</select></label>
+        <label class="field"><span>Pozná podle</span><input class="input" name="pattern" value="${U.esc(r.pattern || '')}" placeholder="${U.esc(U.patternFor(r.name) || 'slovo z popisu')}" autocomplete="off"></label>
+      </div>
+      <label class="check"><input type="checkbox" name="auto"${r.next_date ? ' checked' : ''}><span>Strhává se samo v určitý den</span></label>
+      <label class="field date-field"><span>Příští platba</span><input class="input" type="date" name="next" value="${r.next_date || ''}"></label>
+      <p class="hint date-hint"></p>
       ${isNew ? '' : `<label class="check"><input type="checkbox" name="active"${r.active ? ' checked' : ''}><span>Aktivní</span></label>`}
-      <p class="hint">V den platby se pohyb zapíše sám.</p>
       <p class="form-err" role="alert"></p>
-      <div class="sheet-actions">${isNew ? '' : '<button type="button" class="btn ghost danger" data-del>Smazat</button>'}<button class="btn primary" type="submit">${isNew ? 'Přidat platbu' : 'Uložit změny'}</button></div>
+      <div class="sheet-actions">${isNew ? '' : '<button type="button" class="btn ghost danger" data-del>Smazat</button>'}<button class="btn primary" type="submit">${isNew ? 'Přidat' : 'Uložit změny'}</button></div>
     </form>`, sheet => {
       const form = sheet.querySelector('form');
       const segBtns = sheet.querySelectorAll('.seg button');
-      const paint = () => segBtns.forEach(b => { b.classList.toggle('on', b.dataset.k === kind); b.setAttribute('aria-pressed', b.dataset.k === kind); });
+      const paint = () => {
+        segBtns.forEach(b => { b.classList.toggle('on', b.dataset.k === kind); b.setAttribute('aria-pressed', b.dataset.k === kind); });
+        const needDate = form.every.value !== 'month';
+        if (needDate) form.auto.checked = true;
+        form.auto.disabled = needDate;
+        sheet.querySelector('.date-field').hidden = !form.auto.checked;
+        sheet.querySelector('.date-hint').textContent = form.auto.checked
+          ? 'V tento den se platba zapíše sama, třeba u předplatného strhávaného z karty.'
+          : 'Kapsa s platbou počítá od začátku období. Zapíše se, až ji pozná v Apple Pay nebo ve výpisu, nebo když ťukneš na Zaplaceno.';
+        form.pattern.placeholder = U.patternFor(form.name.value) || 'slovo z popisu';
+      };
       paint();
+      form.addEventListener('change', paint);
+      form.name.addEventListener('input', paint);
       segBtns.forEach(b => b.addEventListener('click', () => { kind = b.dataset.k; paint(); form.cat.innerHTML = catOptions(kind); }));
       const del = sheet.querySelector('[data-del]');
       if (del) del.addEventListener('click', async () => {
-        if (!confirm('Smazat pravidelnou platbu? Už zapsané pohyby zůstanou.')) return;
-        try { await Store.remove('recurring', r.id); closeSheet(); render(); toast('Platba smazána'); } catch (e) { fail(e, 'Smazání'); }
+        if (!confirm('Smazat pravidelný výdaj? Už zapsané pohyby zůstanou.')) return;
+        try { await Store.remove('recurring', r.id); closeSheet(); render(); toast('Smazáno'); } catch (e) { fail(e, 'Smazání'); }
       });
       form.addEventListener('submit', async e => {
         e.preventDefault();
         const err = sheet.querySelector('.form-err');
         const amount = U.parseAmount(form.amount.value);
         if (!form.name.value.trim()) { err.textContent = 'Vyplň název.'; return; }
-        if (!amount || amount <= 0) { err.textContent = 'Zadej částku větší než nula.'; return; }
-        if (!form.next.value) { err.textContent = 'Vyber datum příští platby.'; return; }
-        const row = { name: form.name.value.trim(), amount, kind, every: form.every.value, next_date: form.next.value, category_id: form.cat.value || null, active: form.active ? form.active.checked : true };
+        if (!amount || amount <= 0) { err.textContent = 'Zadej částku nebo odhad.'; return; }
+        if (form.auto.checked && !form.next.value) { err.textContent = form.every.value === 'month' ? 'Vyber den, kdy se platba strhává, nebo zruš zaškrtnutí.' : 'U čtvrtletních a ročních plateb vyplň datum příští platby.'; return; }
+        const row = {
+          name: form.name.value.trim(), amount, kind, every: form.every.value,
+          next_date: form.auto.checked ? form.next.value : null,
+          pattern: U.norm(form.pattern.value) || U.patternFor(form.name.value) || null,
+          category_id: form.cat.value || null, active: form.active ? form.active.checked : true,
+        };
         try {
           if (isNew) await Store.insert('recurring', row);
           else await Store.update('recurring', r.id, row);
           await processRecurring();
-          closeSheet(); render(); toast(isNew ? 'Platba přidána' : 'Změny uloženy');
+          closeSheet(); render(); toast(isNew ? 'Přidáno, počítám s tím dopředu' : 'Změny uloženy');
         } catch (ex) { fail(ex); }
       });
     });
+  }
+
+  function payRecSheet(r) {
+    if (!r) return;
+    openSheet(`<form class="form" novalidate>
+      ${sheetHead(`${U.esc(r.name)}: zaplaceno`)}
+      <label class="amount-field"><span class="sr">Částka v korunách</span><input name="amount" inputmode="decimal" autocomplete="off" value="${U.esc(String(r.amount).replace('.', ','))}"><span class="cur">Kč</span></label>
+      <p class="hint">Zapíšu platbu do pohybů. Když se částka liší od plánu, oprav ji.</p>
+      <label class="field"><span>Kdy odešla</span><input class="input" type="datetime-local" name="when" value="${U.toLocalInput(new Date())}"></label>
+      <p class="form-err" role="alert"></p>
+      <div class="sheet-actions"><button class="btn primary" type="submit">Zapsat platbu</button></div>
+    </form>`, sheet => {
+      const form = sheet.querySelector('form');
+      form.addEventListener('submit', async e => {
+        e.preventDefault();
+        const amount = U.parseAmount(form.amount.value);
+        if (!amount || amount <= 0) { sheet.querySelector('.form-err').textContent = 'Zadej částku větší než nula.'; return; }
+        try {
+          await Store.insert('transactions', { kind: 'expense', amount, category_id: r.category_id, merchant: r.name, recurring_id: r.id, occurred_at: new Date(form.when.value || Date.now()).toISOString(), status: 'confirmed', source: 'manual' });
+          closeSheet(); render(); toast(`${r.name}: zapsáno ${U.money(amount)}`);
+        } catch (ex) { fail(ex); }
+      });
+    });
+  }
+
+  function balanceSheet() {
+    const cur = balance();
+    openSheet(`<form class="form" novalidate>
+      ${sheetHead('Zůstatek na účtu')}
+      <label class="amount-field"><span class="sr">Zůstatek v korunách</span><input name="amount" inputmode="decimal" autocomplete="off" placeholder="0" value="${cur == null ? '' : U.esc(String(Math.round(cur * 100) / 100).replace('.', ','))}"><span class="cur">Kč</span></label>
+      <p class="hint">Opiš zůstatek z bankovnictví. Od teď k němu budu přičítat a odečítat všechno, co se v Kapse zapíše. Když se bude lišit, nejspíš chybí nějaká platba.</p>
+      <p class="form-err" role="alert"></p>
+      <div class="sheet-actions"><button class="btn primary" type="submit">Uložit zůstatek</button></div>
+    </form>`, sheet => {
+      const form = sheet.querySelector('form');
+      form.amount.focus();
+      form.addEventListener('submit', async e => {
+        e.preventDefault();
+        const v = U.parseAmount(form.amount.value);
+        if (v == null) { sheet.querySelector('.form-err').textContent = 'Zadej částku.'; return; }
+        try {
+          await Store.saveSettings({ balance_anchor: v, balance_anchor_at: new Date().toISOString() });
+          closeSheet(); render();
+          const diff = cur == null ? 0 : v - cur;
+          toast(Math.abs(diff) >= 1 ? `Srovnáno. Kapsa se lišila o ${U.money(Math.abs(diff))}, ${diff < 0 ? 'nejspíš chybí zapsaný výdaj' : 'nejspíš chybí zapsaný příjem'}.` : 'Zůstatek uložen', Math.abs(diff) >= 1 ? 'warn' : '');
+        } catch (ex) { fail(ex); }
+      });
+    });
+  }
+
+  async function linkRec(txId, recId) {
+    const t = txById(txId), r = D.recurring.find(x => x.id === recId);
+    if (!t || !r) return;
+    try {
+      await Store.update('transactions', txId, { recurring_id: r.id, category_id: r.category_id || t.category_id, status: 'confirmed' });
+      if (!r.pattern && t.merchant) await Store.update('recurring', r.id, { pattern: U.patternFor(t.merchant) });
+      render();
+      toast(`${r.name}: zapsáno jako zaplacené`);
+    } catch (e) { fail(e); }
   }
 
   function goalSheet(goal) {
@@ -1257,20 +1804,26 @@
       const btn = step.querySelector('[data-go]');
       btn.disabled = !parsed.length;
       btn.textContent = `Importovat ${parsed.length} ${U.plural(parsed.length, 'pohyb', 'pohyby', 'pohybů')}`;
-      btn.onclick = () => runImport(parsed, btn);
+      btn.onclick = () => runImport(parsed, btn, step.querySelector('[name=acc]') ? step.querySelector('[name=acc]').value : null);
     };
     step.innerHTML = `<p class="lead-p">Zkontroluj, že sloupce sedí. Ukázka prvních řádků je dole.</p>
       <div class="mapgrid">${fields.map(([k, l]) => `<label class="field"><span>${l}</span><select class="select" name="${k}">${opts(map[k])}</select></label>`).join('')}</div>
+      ${accounts().filter(a => a.currency !== 'BTC').length > 1 ? `<label class="field"><span>Výpis z účtu</span><select class="select" name="acc">${accounts().filter(a => a.currency !== 'BTC').map(a => `<option value="${a.id}"${a.is_main ? ' selected' : ''}>${U.esc(a.name)}</option>`).join('')}</select></label>` : ''}
       <div class="pv"></div>
       <div class="sheet-actions"><button class="btn primary" data-go type="button">Importovat</button></div>`;
     step.querySelectorAll('select').forEach(s => s.addEventListener('change', preview));
     preview();
   }
 
-  async function runImport(parsed, btn) {
+  async function runImport(parsed, btn, accId = null) {
+    const acc = accById(accId);
+    const toMain = !acc || acc.is_main;
+    const accField = toMain ? null : acc.id;
+    const sameAcc = t => (toMain ? isMainId(t.account_id) : t.account_id === acc.id) || (t.kind === 'transfer' && t.to_account_id && (toMain ? isMainId(t.to_account_id) : t.to_account_id === acc.id));
     btn.disabled = true; btn.textContent = 'Importuji…';
     const existing = new Set(D.transactions.map(t => t.external_id).filter(Boolean));
     const used = new Set();
+    const usedRec = new Set();
     const seen = {};
     const inserts = [], links = [];
     let dup = 0;
@@ -1281,10 +1834,16 @@
       if (!x.id) { seen[ext] = (seen[ext] || 0) + 1; if (seen[ext] > 1) ext += `#${seen[ext]}`; }
       if (existing.has(ext)) { dup++; continue; }
       const sameDir = t => kind === 'expense' ? (t.kind === 'expense' || t.kind === 'transfer') : t.kind === 'income';
-      const match = D.transactions.find(t => !t.external_id && !used.has(t.id) && sameDir(t) && Math.abs(Number(t.amount) - amount) < 0.01 && Math.abs(when(t) - x.d) <= 3.5 * U.DAY);
+      const match = D.transactions.find(t => !t.external_id && !used.has(t.id) && sameAcc(t) && sameDir(t) && Math.abs(Number(t.amount) - amount) < 0.01 && Math.abs(when(t) - x.d) <= 3.5 * U.DAY);
       if (match) { used.add(match.id); links.push([match.id, ext]); continue; }
+      const rec = kind === 'expense' && toMain ? matchObligation(x.t, amount, x.d, usedRec) : null;
+      if (rec) {
+        usedRec.add(`${rec.id}@${U.isoDate(U.period(x.d, startDay()).start)}`);
+        inserts.push({ occurred_at: x.d.toISOString(), amount, kind, merchant: x.t.slice(0, 140) || rec.name, category_id: rec.category_id, recurring_id: rec.id, status: 'confirmed', source: 'csv', external_id: ext, account_id: accField });
+        continue;
+      }
       const cat = matchRule(x.t);
-      inserts.push({ occurred_at: x.d.toISOString(), amount, kind, merchant: x.t.slice(0, 140) || null, category_id: cat, status: cat ? 'confirmed' : 'pending', source: 'csv', external_id: ext });
+      inserts.push({ occurred_at: x.d.toISOString(), amount, kind, merchant: x.t.slice(0, 140) || null, category_id: cat, status: cat ? 'confirmed' : 'pending', source: 'csv', external_id: ext, account_id: accField });
     }
     try {
       for (const [id, ext] of links) await Store.update('transactions', id, { external_id: ext });
@@ -1299,7 +1858,7 @@
   async function processRecurring() {
     if (Store.mode === 'offline') return;
     const today = U.startOfDay(new Date());
-    for (const r of D.recurring.filter(x => x.active)) {
+    for (const r of D.recurring.filter(x => x.active && x.next_date)) {
       let guard = 0;
       while (U.parseISODate(r.next_date) <= today && guard++ < 36) {
         const due = U.parseISODate(r.next_date);
@@ -1318,15 +1877,16 @@
     const amount = Math.round((b.amount - b.done) * 100) / 100;
     if (amount <= 0) return;
     try {
-      await Store.insert('transactions', { kind: 'transfer', bucket: b.id, amount, merchant: b.name, occurred_at: new Date().toISOString(), status: 'confirmed', source: 'manual', category_id: null });
+      const to = bucketAccount(b);
+      await Store.insert('transactions', { kind: 'transfer', bucket: b.id, amount, merchant: to ? `Běžný účet → ${to.name}` : b.name, to_account_id: to ? to.id : null, occurred_at: new Date().toISOString(), status: 'confirmed', source: 'manual', category_id: null });
       render();
-      toast(`Odloženo ${U.money(amount)}: ${b.name}`);
+      toast(`Odloženo ${U.money(amount)}${bucketAccount(b) ? ` na ${bucketAccount(b).name}` : `: ${b.name}`}. Nezapomeň peníze převést i v bance.`);
     } catch (e) { fail(e); }
   }
 
   function incomePreset() {
     const c = cats('income').find(x => U.norm(x.name).includes('vyplat')) || cats('income')[0];
-    return { kind: 'income', category_id: c ? c.id : null, merchant: 'Výplata' };
+    return { kind: 'income', category_id: c ? c.id : null, merchant: 'Výplata', amount: '' };
   }
 
   // ---------- události ----------
@@ -1337,8 +1897,15 @@
     const a = el.dataset.action, id = el.dataset.id;
     switch (a) {
       case 'add-tx': txSheet(); break;
-      case 'add-income': txSheet(null, incomePreset()); break;
-      case 'edit-tx': txSheet(txById(id)); break;
+      case 'add-income':
+      case 'salary': txSheet(null, incomePreset()); break;
+      case 'balance': accountSheet(mainAcc()); break;
+      case 'pay-rec': payRecSheet(D.recurring.find(r => r.id === id)); break;
+      case 'link-rec': await linkRec(id, el.dataset.rec); break;
+      case 'edit-tx': { const t = txById(id); if (t && t.kind === 'transfer') transferSheet(t); else txSheet(t); break; }
+      case 'transfer-new': transferSheet(); break;
+      case 'acc': accountSheet(accById(id)); break;
+      case 'acc-new': accountSheet({ name: '', type: 'savings', currency: 'CZK', color: SWATCHES[(D.accounts || []).length % SWATCHES.length] }); break;
       case 'confirm': await confirmTx(id, el.dataset.cat); break;
       case 'delete-tx': await deleteTx(id); break;
       case 'transfer': await markTransfer(el.dataset.b); break;
@@ -1469,6 +2036,23 @@
     });
   }
 
+  async function fetchBtc() {
+    if (!accounts().some(a => a.currency === 'BTC')) return;
+    const p = btcPrice();
+    const age = p ? Date.now() - new Date(p.at).getTime() : Infinity;
+    if (p && (age < 15 * 60000 || (p.source === 'manual' && age < 6 * 3600000))) return;
+    try {
+      const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=czk', { cache: 'no-store' });
+      const j = await r.json();
+      const v = j && j.bitcoin && j.bitcoin.czk;
+      if (!v) throw new Error('bez kurzu');
+      setBtcPrice(v, 'coingecko');
+    } catch (e) {
+      if ((window.KAPSA_DEMO || /[?&]demo\b/.test(location.search)) && !p) setBtcPrice(1950000, 'demo');
+    }
+    if (!sheetRoot.firstChild) render();
+  }
+
   async function boot() {
     if (D.settings) route();
     else main.innerHTML = '<p class="loading">Načítám…</p>';
@@ -1484,6 +2068,7 @@
       toast('Nepodařilo se načíst nejnovější data, zobrazuji uložená.', 'warn');
     }
     route();
+    fetchBtc();
   }
 
   async function start() {

@@ -42,7 +42,7 @@ Tohle je část, díky které nemusíš nic opisovat. Po každé platbě telefon
 Údaje, které budeš vkládat, najdeš v Kapse v **Nastavení → Platby z Apple Pay**. Každý má tlačítko na zkopírování, takže je nejjednodušší dělat Zkratku přímo v iPhonu.
 
 1. Otevři aplikaci **Zkratky**, dole záložku **Automatizace** a ťukni na **+**.
-2. Vyber **Transakce**. Zvol svou kartu Raiffeisenbank, kategorie obchodníků nech všechny. Zaškrtni **Spustit okamžitě** (jinak by se tě iPhone pokaždé ptal) a pokračuj **Další**.
+2. Vyber **Transakce**. Zvol karty, které chceš sledovat (osobní i firemní), kategorie obchodníků nech všechny. Zaškrtni **Spustit okamžitě** (jinak by se tě iPhone pokaždé ptal) a pokračuj **Další**.
 3. Zvol **Nová prázdná automatizace** a přidej akci **Získat obsah URL**.
    - Do pole URL vlož **Adresu** z Kapsy.
    - Rozbal šipku u akce. **Metoda:** POST.
@@ -50,7 +50,8 @@ Tohle je část, díky které nemusíš nic opisovat. Po každé platbě telefon
    - **Tělo požadavku:** JSON. Přidej tři textová pole:
      - `p_token` s hodnotou **p_token** z Kapsy,
      - `p_amount` s proměnnou **Částka** (ťukni do hodnoty, vyber Vstup zkratky a vlastnost Částka),
-     - `p_merchant` s proměnnou **Obchodník** (stejně jako u částky).
+     - `p_merchant` s proměnnou **Obchodník** (stejně jako u částky),
+     - `p_card` s proměnnou **Karta nebo propustka**. Podle ní Kapsa pozná, z jakého účtu se platilo.
 4. Volitelně přidej akci **Získat hodnotu slovníku**: hodnota pro klíč `zprava` ve slovníku **Obsah URL**. Za ni přidej **Zobrazit oznámení** s textem **Hodnota slovníku**. Po každé platbě pak uvidíš třeba „Potraviny: zbývá 2 880 Kč z 4 475 Kč. Dnes ještě 412 Kč.“ a při blížícím se limitu varování.
 5. Ulož. Při příští platbě se v Kapse objeví položka v sekci **Ke kontrole** s navrženou kategorií.
 
@@ -72,23 +73,43 @@ Platby, které už Kapsa zná ze Zkratky nebo z pravidelných plateb, se podle �
 
 ## 6. Jak Kapsa počítá
 
-**Rozdělení výplaty.** Když přijde výplata, zapiš ji (na Přehledu je tlačítko Zapsat výplatu). Kapsa z ní nejdřív odečte pevné výdaje: všechny pravidelné platby v období a vše v kategoriích označených jako pevné (nájem, energie, předplatné). Zbytek rozdělí podle obálek v **Plán → Rozdělení**, výchozí je 20 % krátkodobé úspory, 30 % dlouhodobé investice a 50 % spotřeba. Obálky můžeš přejmenovat, změnit procenta nebo přidat vlastní (třeba Dárky 5 %); součet musí být 100 %.
+**Výplata.** Když přijde, ťukni na Výplata přišla a zadej částku. Kapsa ji dopředu neodhaduje: dokud novou výplatu nezapíšeš, pracuje jen se zbytkem z minulého období. Zachytit ji sama neumí, protože zápis z Apple Pay spouští přiložení telefonu k terminálu, ne notifikace banky, a výplata přichází převodem. Výplata se zachytí i při importu CSV výpisu.
 
-**Odkládání.** U obálek na úspory Kapsa ukáže, kolik poslat stranou. Peníze převeď v bankovnictví a v Kapse ťukni na Označit jako odložené. Odložené peníze se nepočítají jako útrata. Když převod později přijde v CSV výpisu, spáruje se a nezdvojí.
+**Rozdělení.** Z výplaty se nejdřív odečtou pevné výdaje: všechny pravidelné výdaje v plánované výši (i když ještě neodešly) a platby v kategoriích označených jako pevné. Zbytek se rozdělí podle obálek v **Plán → Rozdělení**, výchozí je 20 % krátkodobé úspory, 30 % dlouhodobé investice a 50 % spotřeba. Obálky můžeš přejmenovat, změnit procenta nebo přidat vlastní; součet musí být 100 %.
 
-**Denní limit.** Peníze na spotřebu minus to, co už jsi v období utratil mimo pevné výdaje, rozpočítané na zbývající dny včetně dneška. Dokud v období nezapíšeš výplatu, Kapsa počítá s tou minulou a upozorní tě na to.
+**Pravidelné výdaje** nepotřebují datum. Kapsa s nimi počítá od začátku období a do pohybů je zapíše, až skutečně odejdou. Pozná je třemi způsoby:
+- platba přes Apple Pay, jejíž obchodník obsahuje slovo z pole Pozná podle,
+- řádek v importovaném CSV výpisu (podle slova nebo přesné částky),
+- ťuknutí na Zaplaceno u výdaje na Přehledu; částku můžeš opravit, třeba u energií.
 
-**Limity kategorií.** U každé proměnlivé kategorie nastavíš limit buď jako procento ze spotřeby, nebo jako pevnou částku. Procenta se přizpůsobí výši výplaty, což se při kolísavém příjmu hodí víc. V Plán → Limity uvidíš, kolik ze spotřeby je rozdělené a kolik zůstává volné.
+U plateb, které se strhávají samy v pevný den (předplatné z karty), zaškrtni Strhává se samo a zadej den. Ty se zapíšou automaticky.
 
-**Tipy.** Kapsa průběžně sleduje tvoje data a radí: připomene neodložené peníze, upozorní na kategorii, ve které tímhle tempem přetáhneš limit, navrhne zvýšit limit, který pravidelně nestačí, nebo snížit ten, který nevyčerpáš, najde časté drobné nákupy a opakované platby, které nemáš mezi pravidelnými. U návrhu limitu stačí ťuknout a změní se. Tipy, které nechceš vidět, skryješ do konce období. Čím víc měsíců dat, tím jsou tipy přesnější; ty o dlouhodobých limitech potřebují aspoň dvě celá období.
+**Zbytek spotřeby** se na konci období převádí do dalšího. Přečerpání se nepřevádí.
+
+**Zůstatek na účtu** jednou opiš z bankovnictví (ťukni na dlaždici Na účtu). Kapsa k němu pak přičítá a odečítá všechno, co zapíše. Občas ho srovnej s bankou; rozdíl znamená, že nějaká platba v Kapse chybí.
+
+**Odkládání.** U obálek na úspory Kapsa ukáže, kolik poslat stranou. Peníze převeď v bankovnictví a v Kapse ťukni na Označit jako odložené. Odložené peníze se nepočítají jako útrata.
+
+**Denní limit** jsou peníze na spotřebu (včetně zbytku z minula) minus to, co jsi v období utratil mimo pevné výdaje, rozpočítané na zbývající dny včetně dneška.
+
+**Limity kategorií** nastavíš buď jako procento ze spotřeby, nebo jako pevnou částku. Procenta se přizpůsobí výši výplaty.
+
+**Tipy** připomenou neodložené peníze a nezaplacené pravidelné výdaje, upozorní na kategorii, ve které tímhle tempem přetáhneš limit, navrhnou úpravu limitů podle posledních měsíců, najdou časté drobné nákupy a opakované platby, které nemáš mezi pravidelnými. Návrhy limitů se dají přijmout jedním ťuknutím.
 
 **Oznámení po platbě** ze Zkratky ukazuje stav kategorie a kolik ti ještě dnes zbývá, třeba „Potraviny: zbývá 2 880 Kč z 4 475 Kč. Dnes ještě 412 Kč.“
 
 **Rozpočtové období** začíná dnem, který nastavíš v Nastavení. Nastav den, kdy ti obvykle chodí výplata.
 
-**Automatické zařazování:** když platbu zařadíš, Kapsa si zapamatuje první slovo obchodníka (u plateb přes SumUp, GoPay a podobné první dvě). Pravidla upravíš v Nastavení.
+## Účty
 
-**Pravidelné platby** se zapíšou samy v den splatnosti, jakmile Kapsu otevřeš.
+Kapsa vede pět účtů: běžný, spořicí, investiční, podnikatelský a bitcoin. Další přidáš na stránce Účty (na počítači v levém menu, na mobilu přes Spravovat účty na Přehledu).
+
+- **Rozpočet, denní limit a tipy** počítají jen s běžným účtem. Výdaje na ostatních účtech se do nich nepromítnou.
+- **Zůstatek** každého účtu jednou opiš z bankovnictví. Kapsa ho pak přepočítává podle pohybů. U investic a bitcoinu občas zadej aktuální hodnotu; když vyplníš i kolik jsi celkem vložil, Kapsa ukáže zisk nebo ztrátu a vklady i výběry do něj sama započítá.
+- **Převody** mezi účty se nepočítají jako útrata ani příjem. Výjimka je převod na běžný účet z jiného účtu, který označíš jako příjem. Hodí se pro výběr z podnikání pro sebe a u převodu z podnikatelského účtu je to předvyplněné. Takový převod se rozdělí stejně jako výplata.
+- **Obálky** z výplaty jsou propojené s účty (Plán → Rozdělení, pole Posílat na). Označit jako odložené tak rovnou zapíše převod na spořicí nebo investiční účet. Peníze ale musíš převést i v bance.
+- **Bitcoin** se vede v BTC. Kurz v korunách se načítá z CoinGecko; když se nenačte, zadáš ho ručně v detailu účtu. U nákupu zadáš, kolik korun odešlo a kolik bitcoinu přišlo.
+- **Karta v Peněžence:** u podnikatelského účtu vyplň název firemní karty, jak ho vidíš v Peněžence. Platby touto kartou pak Zkratka zapíše na podnikatelský účet, ne do osobního rozpočtu.
 
 ## 7. Úpravy a aktualizace
 
